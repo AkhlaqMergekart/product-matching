@@ -441,3 +441,7 @@ projectId}. Total matched products: ${matchedProducts.length}`,
         res.status(500).json({ error: "An error occurred during product matching." });
     }
 });
+
+app.listen("6000", () => {
+    console.log("Server is running on port 6000");
+});
