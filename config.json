@@ -1,0 +1,7 @@
+{
+  "SMTP_Hostname": "smtp.mailer91.com",
+  "SMTP_Port": "'587",
+  "SMTP_Username": "emailer@alert.sellerpundit.com",
+  "SMTP_Password": "8kfgEKb4GlPMMOl8",
+  "FROM_EMAIL": "No-reply@alert.sellerpundit.com"
+}
