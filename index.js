@@ -62,7 +62,6 @@ async function productMatching(brand, projectId) {
                 brand: brand,
                 projectId: projectId
             },
-            limit: 1,
             raw: true,
             attributes: ['title', 'url', 'brand', 'sku', 'category', 'images', 'attributes', 'price', 'mrp']
         });
