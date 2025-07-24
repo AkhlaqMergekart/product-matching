@@ -88,7 +88,7 @@ async function productMatching(brand, projectId) {
 
             const sourceProduct = sourceProducts[x];
 
-            const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}&refinementList%5Bmanufacturer%5D%5B0%5D=TEKNUM`;
+            const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}`;
 
             console.log(x, sourceProduct.title, url);
 
