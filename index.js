@@ -6,6 +6,7 @@ const dom = require('xmldom').DOMParser;
 const puppeteer = require('puppeteer');
 const express = require('express');
 const app = express();
+const sendUpdateReportEmail = require("./helper/sendUpdateReport.js");
 
 require("./database/config.js");
 
@@ -56,13 +57,14 @@ async function productMatching(brand, projectId) {
             throw new Error("Brand and projectId are required parameters.");
         }
 
-        const sourceProducts = ScratchProducts.findAll({
+        const sourceProducts = await ScratchProducts.findAll({
             where: {
                 brand: brand,
                 projectId: projectId
             },
+            limit: 1,
             raw: true,
-            attributes: ['title', 'url', 'brand', 'sku', 'category', 'images', 'attributes']
+            attributes: ['title', 'url', 'brand', 'sku', 'category', 'images', 'attributes', 'price', 'mrp']
         });
 
         const browser = await puppeteer.launch({
@@ -78,6 +80,11 @@ async function productMatching(brand, projectId) {
         console.log("Source products count:", sourceProducts.length);
 
         let retryCount = 0;
+
+        const outputFilePath = `products_matched_final_${brand}_${projectId}_${Date.now()}.json`;
+        const errorFilePath = `products_matching_errors_${brand}_${projectId}_${Date.now()}.json`;
+        const matchedFilePath = `products_matched_${brand}_${projectId}_${Date.now()}.json`;
+
         for (var x = 0; x < sourceProducts.length; x++) {
 
             const sourceProduct = sourceProducts[x];
@@ -99,7 +106,7 @@ async function productMatching(brand, projectId) {
                 retryCount++;
                 if (retryCount >= 3) {
                     console.error("Max retries reached for source product:", sourceProduct.title);
-                    await appendToFile("products_matching_errors.json", {
+                    await appendToFile(errorFilePath, {
                         sourceProduct: sourceProduct,
                         error: "Max retries reached"
                     });
@@ -136,7 +143,7 @@ async function productMatching(brand, projectId) {
 
                         if (retryCount >= 3) {
                             console.error("Max retries reached for source product:", sourceProduct.title);
-                            await appendToFile("products_matching_errors.json", {
+                            await appendToFile(errorFilePath, {
                                 sourceProduct: sourceProduct,
                                 error: "Max retries reached"
                             });
@@ -165,7 +172,7 @@ async function productMatching(brand, projectId) {
 
                 } catch (err) {
                     console.error("Error fetching product links:", err);
-                    await appendToFile("products_matching_errors.json", {
+                    await appendToFile(errorFilePath, {
                         sourceProduct: sourceProduct,
                         error: err.message
                     });
@@ -247,7 +254,7 @@ async function productMatching(brand, projectId) {
             } catch (error) {
                 console.error("Error processing product links:", error);
 
-                await appendToFile("products_matching_errors.json", {
+                await appendToFile(errorFilePath, {
                     sourceProduct: sourceProduct,
                     error: error.message
                 });
@@ -257,7 +264,7 @@ async function productMatching(brand, projectId) {
 
             if (productBatches.length === 0) {
                 console.log("No products found for:", sourceProduct.title);
-                await appendToFile("products_matching_errors.json", {
+                await appendToFile(errorFilePath, {
                     sourceProduct: sourceProduct,
                     error: "No products found"
                 });
@@ -301,9 +308,9 @@ async function productMatching(brand, projectId) {
 
                 }
             } catch (error) {
-                console.error("Error matching products:", error);
+                console.error("Error matching products:", JSON.stringify(error.response.data));
 
-                await appendToFile("products_matching_errors.json", {
+                await appendToFile(errorFilePath, {
                     sourceProduct: sourceProduct,
                     error: error.message
                 });
@@ -313,7 +320,7 @@ async function productMatching(brand, projectId) {
 
             if (matchData.length === 0) {
                 console.log("No match data found for:", sourceProduct.title);
-                await appendToFile("products_matching_errors.json", {
+                await appendToFile(errorFilePath, {
                     sourceProduct: sourceProduct,
                     error: "No match data found"
                 });
@@ -322,7 +329,7 @@ async function productMatching(brand, projectId) {
 
             console.log("Match data found:", matchData.length);
 
-            await appendToFile("products_matched.json", {
+            await appendToFile(matchedFilePath, {
                 sourceProduct: sourceProduct,
                 matchedProducts: matchData,
             });
@@ -340,7 +347,7 @@ async function productMatching(brand, projectId) {
                             matchedProducts: matchData[i],
                         };
 
-                        await appendToFile("products_matched_final.json", finalObj);
+                        await appendToFile(outputFilePath, finalObj);
                         foundProductCount++;
                         break; // Break after finding the first match
                     }
@@ -351,7 +358,7 @@ async function productMatching(brand, projectId) {
             } catch (error) {
                 console.error("Error processing match data:", error);
 
-                await appendToFile("products_matching_errors.json", {
+                await appendToFile(errorFilePath, {
                     sourceProduct: sourceProduct,
                     error: error.message
                 });
@@ -362,12 +369,12 @@ async function productMatching(brand, projectId) {
             if (foundProductCount === 0) {
                 console.log("No matching products found for:", sourceProduct.title);
 
-                await appendToFile("products_matching_errors.json", {
+                await appendToFile(errorFilePath, {
                     sourceProduct: sourceProduct,
                     error: "No matching products found"
                 });
 
-                await appendToFile("products_matched_final.json", {
+                await appendToFile(outputFilePath, {
                     sourceProduct: sourceProduct,
                     matchedProducts: {}
                 });
@@ -380,10 +387,12 @@ async function productMatching(brand, projectId) {
 
         await browser.close();
 
-        const allProducts = JSON.parse(fs.readFileSync("products_matched_final.json", "utf8"));
+        const allProducts = JSON.parse(fs.readFileSync(outputFilePath, "utf8"));
         console.log("Total matched products:", allProducts.length);
 
-        return allProducts;
+        console.log("Product matching completed successfully.");
+
+        return { allProducts, outputFilePath};
 
     } catch (err) {
         console.error("Error:", err);
@@ -406,8 +415,8 @@ app.post('/product-matching', async (req, res) => {
 
         res.status(200).json({ message: "Product matching started successfully." });
 
-        const matchedProducts = await productMatching(brand, projectId);
-    
+        const { allProducts, outputFilePath } = await productMatching(brand, projectId);
+
         console.log("Product matching completed successfully.");
 
         const mailOptions = {
@@ -415,11 +424,11 @@ app.post('/product-matching', async (req, res) => {
             to: "akhlaq@mergekart.com",
             subject: `Product Matching Report for ${brand} - ${projectId}`,
             text: `Product matching completed successfully for brand: ${brand} and projectId: ${
-projectId}. Total matched products: ${matchedProducts.length}`,
+projectId}. Total matched products: ${allProducts.length}`,
             attachments: [
                 {
                     filename: 'products_matched_final.json',
-                    path: './products_matched_final.json'
+                    path: outputFilePath
                 }
             ]
         };
