@@ -424,8 +424,7 @@ app.post('/product-matching', async (req, res) => {
             from: config.FROM_EMAIL,
             to: "akhlaq@mergekart.com",
             subject: `Product Matching Report for ${brand} - ${projectId}`,
-            text: `Product matching completed successfully for brand: ${brand} and projectId: ${
-projectId}. Total matched products: ${allProducts.length}`,
+            text: `Product matching completed successfully for brand: ${brand} and projectId: ${projectId}. Total matched products: ${allProducts.length}`,
             attachments: [
                 {
                     filename: 'products_matched_final.json',
@@ -442,6 +441,8 @@ projectId}. Total matched products: ${allProducts.length}`,
             ]
         };
 
+        await sendUpdateReportEmail(mailOptions);
+
         if (fs.existsSync(outputFilePath)) {
             fs.unlinkSync(outputFilePath);
         }
@@ -454,8 +455,6 @@ projectId}. Total matched products: ${allProducts.length}`,
             fs.unlinkSync(matchedFilePath);
         }
 
-        await sendUpdateReportEmail(mailOptions);
-
     } catch (error) {
         console.error("Error in product matching:", error);
 
@@ -467,7 +466,7 @@ projectId}. Total matched products: ${allProducts.length}`,
         };
 
         await sendUpdateReportEmail(mailOptions);
-        
+
         res.status(500).json({ error: "An error occurred during product matching." });
     }
 });
