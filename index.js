@@ -81,9 +81,9 @@ async function productMatching(brand, projectId) {
 
         let retryCount = 0;
 
-        const outputFilePath = `products_matched_final_${brand}_${projectId}_${Date.now()}.json`;
-        const errorFilePath = `products_matching_errors_${brand}_${projectId}_${Date.now()}.json`;
-        const matchedFilePath = `products_matched_${brand}_${projectId}_${Date.now()}.json`;
+        const outputFilePath = `products_matched_final_${brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
+        const errorFilePath = `products_matching_errors_${brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
+        const matchedFilePath = `products_matched_${brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
 
         for (var x = 0; x < sourceProducts.length; x++) {
 
