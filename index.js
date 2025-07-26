@@ -289,7 +289,7 @@ async function productMatching(brand, projectId) {
                     const config = {
                         method: 'post',
                         maxBodyLength: Infinity,
-                        url: "http://103.30.72.113/api/match",
+                        url: "http://localhost:8000/api/match",
                         headers: {
                             'accept': '*/*',
                             'accept-language': 'en-US,en;q=0.9',
