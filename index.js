@@ -62,6 +62,7 @@ async function productMatching(brand, projectId) {
                 brand: brand,
                 projectId: projectId
             },
+            // limit: 10,
             raw: true,
             attributes: ['title', 'url', 'brand', 'sku', 'category', 'images', 'attributes', 'price', 'mrp']
         });
@@ -229,7 +230,7 @@ async function productMatching(brand, projectId) {
                     // console.log(xpath.select("//img[@class='relative h-full w-full object-contain transition duration-300 ease-in-out group-hover:scale-105']", doc).length)
                     const images = xpath.select("//img[@class='relative h-full w-full object-contain transition duration-300 ease-in-out group-hover:scale-105']", doc).map(itm => "https://www.nahdionline.com" + itm.getAttribute("srcset"))
                     // console.log(description.length)
-
+                    console.log(images)
                     const product = {
                         url: link,
                         category: category || "",
@@ -288,7 +289,7 @@ async function productMatching(brand, projectId) {
                     const config = {
                         method: 'post',
                         maxBodyLength: Infinity,
-                        url: 'http://localhost:8000/api/match',
+                        url: "http://103.30.72.113/api/match",
                         headers: {
                             'accept': '*/*',
                             'accept-language': 'en-US,en;q=0.9',
@@ -307,6 +308,7 @@ async function productMatching(brand, projectId) {
 
                 }
             } catch (error) {
+                console.log(error);
                 console.error("Error matching products:", JSON.stringify(error.response.data));
 
                 await appendToFile(errorFilePath, {
@@ -391,7 +393,7 @@ async function productMatching(brand, projectId) {
 
         console.log("Product matching completed successfully.");
 
-        return { allProducts, outputFilePath};
+        return { allProducts, outputFilePath, errorFilePath, matchedFilePath };
 
     } catch (err) {
         console.error("Error:", err);
@@ -414,7 +416,7 @@ app.post('/product-matching', async (req, res) => {
 
         res.status(200).json({ message: "Product matching started successfully." });
 
-        const { allProducts, outputFilePath } = await productMatching(brand, projectId);
+        const { allProducts, outputFilePath, errorFilePath, matchedFilePath } = await productMatching(brand, projectId);
 
         console.log("Product matching completed successfully.");
 
@@ -427,10 +429,30 @@ projectId}. Total matched products: ${allProducts.length}`,
             attachments: [
                 {
                     filename: 'products_matched_final.json',
-                    path: outputFilePath
+                    path: fs.existsSync(outputFilePath) ? outputFilePath : [],
+                },
+                {
+                    filename: 'products_matching_errors.json',
+                    path: fs.existsSync(errorFilePath) ? errorFilePath : [],
+                },
+                {
+                    filename: 'products_matched.json',
+                    path: fs.existsSync(matchedFilePath) ? matchedFilePath : [],
                 }
             ]
         };
+
+        if (fs.existsSync(outputFilePath)) {
+            fs.unlinkSync(outputFilePath);
+        }
+
+        if (fs.existsSync(errorFilePath)) {
+            fs.unlinkSync(errorFilePath);
+        }
+
+        if (fs.existsSync(matchedFilePath)) {
+            fs.unlinkSync(matchedFilePath);
+        }
 
         await sendUpdateReportEmail(mailOptions);
 
