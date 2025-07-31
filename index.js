@@ -237,8 +237,8 @@ async function productMatching(brand, projectId) {
                         brand: brand || "",
                         title: title || "",
                         sku: link.split("/").pop().split("?")[0] || "",
-                        price: price || mrp || "",
-                        mrp: mrp || "",
+                        price: parseFloat(price) || parseFloat(mrp) || 0,
+                        mrp: parseFloat(mrp) || 0,
                         totalRating: totalRating || "",
                         totalReview: totalReview || "",
                         express: express || false,
@@ -280,8 +280,11 @@ async function productMatching(brand, projectId) {
                 for (let i = 0; i < productBatches.length; i += batchSize) {
                     const batch = productBatches.slice(i, i + batchSize);
 
+                    sourceProduct.dataValues.price = sourceProduct.dataValues.price ? parseFloat(sourceProduct.dataValues.price) : 0;
+                    sourceProduct.dataValues.mrp = sourceProduct.dataValues.mrp ? parseFloat(sourceProduct.dataValues.mrp) : 0;
+
                     const jsonBody = {
-                        "original_product": sourceProduct,
+                        "original_product": sourceProduct.dataValues,
                         "comparable_products": batch,
                         "include_image_similarity": true
                     };
