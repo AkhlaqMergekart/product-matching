@@ -280,11 +280,11 @@ async function productMatching(brand, projectId) {
                 for (let i = 0; i < productBatches.length; i += batchSize) {
                     const batch = productBatches.slice(i, i + batchSize);
 
-                    sourceProduct.dataValues.price = sourceProduct.dataValues.price ? parseFloat(sourceProduct.dataValues.price) : 0;
-                    sourceProduct.dataValues.mrp = sourceProduct.dataValues.mrp ? parseFloat(sourceProduct.dataValues.mrp) : 0;
+                    sourceProduct.price = sourceProduct.price ? parseFloat(sourceProduct.price) : 0;
+                    sourceProduct.mrp = sourceProduct.mrp ? parseFloat(sourceProduct.mrp) : 0;
 
                     const jsonBody = {
-                        "original_product": sourceProduct.dataValues,
+                        "original_product": sourceProduct,
                         "comparable_products": batch,
                         "include_image_similarity": true
                     };
