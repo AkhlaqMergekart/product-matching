@@ -67,9 +67,9 @@ async function productMatching(brands, projectId) {
             waitForInitialPage: 10000,
         });
 
-        for (var i = 0; i < brands.length; i++) {
+        for (var z = 0; z < brands.length; z++) {
 
-            const brand = brands[i];
+            const brand = brands[z];
 
             const sourceProducts = await ScratchProducts.findAll({
                 where: {
@@ -89,13 +89,13 @@ async function productMatching(brands, projectId) {
             const errorFilePath = `products_matching_errors_${brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
             const matchedFilePath = `products_matched_${brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
 
-            for (var z = 0; z < sourceProducts.length; z++) {
+            for (var x = 0; x < sourceProducts.length; x++) {
 
-                const sourceProduct = sourceProducts[z];
+                const sourceProduct = sourceProducts[x];
 
                 const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}`;
 
-                console.log(z, sourceProduct.title, url);
+                console.log(x, sourceProduct.title, url);
 
                 const page = await browser.newPage();
                 await page.authenticate({
