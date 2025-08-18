@@ -394,7 +394,7 @@ async function productMatching(brands, projectId) {
                 }
 
             }
-            const allProducts = JSON.parse(fs.readFileSync(outputFilePath, "utf8"));
+            const allProducts = fs.existsSync(outputFilePath) ? JSON.parse(fs.readFileSync(outputFilePath, "utf8")) : [];
             console.log("Total matched products:", allProducts.length);
 
             console.log("Product matching completed successfully.");
