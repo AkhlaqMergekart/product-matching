@@ -95,7 +95,7 @@ async function productMatching(brands, projectId) {
 
                 const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}`;
 
-                console.log(x, sourceProduct.title, url);
+                console.log(z, sourceProduct.title, url);
 
                 const page = await browser.newPage();
                 await page.authenticate({
