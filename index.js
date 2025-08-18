@@ -89,9 +89,9 @@ async function productMatching(brands, projectId) {
             const errorFilePath = `products_matching_errors_${brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
             const matchedFilePath = `products_matched_${brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
 
-            for (var x = 0; x < sourceProducts.length; x++) {
+            for (var z = 0; z < sourceProducts.length; z++) {
 
-                const sourceProduct = sourceProducts[x];
+                const sourceProduct = sourceProducts[z];
 
                 const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}`;
 
