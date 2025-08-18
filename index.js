@@ -88,6 +88,7 @@ async function productMatching(brands, projectId) {
             const outputFilePath = `products_matched_final_${brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
             const errorFilePath = `products_matching_errors_${brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
             const matchedFilePath = `products_matched_${brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
+            const emptyFilePath = `emptyFile.json`
 
             for (var x = 0; x < sourceProducts.length; x++) {
 
@@ -407,15 +408,15 @@ async function productMatching(brands, projectId) {
                 attachments: [
                     {
                         filename: 'products_matched_final.json',
-                        path: fs.existsSync(outputFilePath) ? outputFilePath : [],
+                        path: fs.existsSync(outputFilePath) ? outputFilePath : emptyFilePath,
                     },
                     {
                         filename: 'products_matching_errors.json',
-                        path: fs.existsSync(errorFilePath) ? errorFilePath : [],
+                        path: fs.existsSync(errorFilePath) ? errorFilePath : emptyFilePath,
                     },
                     {
                         filename: 'products_matched.json',
-                        path: fs.existsSync(matchedFilePath) ? matchedFilePath : [],
+                        path: fs.existsSync(matchedFilePath) ? matchedFilePath : emptyFilePath,
                     }
                 ]
             };
