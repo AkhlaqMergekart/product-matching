@@ -81,6 +81,8 @@ async function productMatching(brands, projectId) {
             attributes: ['title', 'url', 'brand', 'sku', 'category', 'images', 'attributes', 'price', 'mrp']
         });
 
+        const brand = sourceProducts[0].brand;
+
         console.log("Brand: ", sourceProducts[0].brand, "Source products count:", sourceProducts.length);
 
         let retryCount = 0;
