@@ -102,8 +102,8 @@ async function productMatching(brands, projectId) {
 
             const page = await browser.newPage();
             await page.authenticate({
-                username: "kqahvuvn-rotate",
-                password: "22suvhg9seb1"
+                username: "ytsahlwj-rotate",
+                password: "9uud0ffubkrr"
             });
 
             try {
@@ -213,8 +213,8 @@ async function productMatching(brands, projectId) {
                     console.log("Processing link:", link);
 
                     await productPage.authenticate({
-                        username: "kqahvuvn-rotate",
-                        password: "22suvhg9seb1"
+                        username: "ytsahlwj-rotate",
+                        password: "9uud0ffubkrr"
                     });
 
                     await productPage.goto(link, { waitUntil: 'networkidle2', timeout: 60000 });
