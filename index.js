@@ -482,6 +482,10 @@ app.post('/product-matching', async (req, res) => {
     }
 });
 
-app.listen("6000", () => {
-    console.log("Server is running on port 6000");
+app.get("/test", async (req, res) => {
+    return res.status(200).json({ message: "API is working fine." });
+});
+
+app.listen(8010, () => {
+    console.log("Server is running on port 8010");
 });
