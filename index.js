@@ -73,7 +73,7 @@ async function productMatching(brands, projectId) {
 
         const sourceProducts = await ScratchProducts.findAll({
             where: {
-                sku: { [Op.in]: brands },
+                sku: { [Op.in]: brands.map(itm => itm.toString()) },
                 projectId: projectId
             },
             // limit: 1,
