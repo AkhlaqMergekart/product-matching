@@ -47,10 +47,10 @@ function appendToFile(filename, data) {
     });
 }
 
-async function productMatching(brands, projectId) {
+async function productMatching(brands, projectId, category) {
     try {
 
-        console.log("Starting product matching for brand:", brands.join(", "), "and projectId:", projectId);
+        console.log("Starting product matching for brand:", brands.join(", "), "and projectId:", projectId, "and category:", category || "All");
 
         if (!brands || brands.length == 0 || !projectId) {
             console.error("Brand and projectId are required parameters.");
@@ -96,7 +96,7 @@ async function productMatching(brands, projectId) {
 
             const sourceProduct = sourceProducts[x];
 
-            const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}`;
+            const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}&refinementList%5Bproduct_type_string%5D%5B0%5D=${encodeURIComponent(category || "")}`;
 
             console.log(x, sourceProduct.title, url);
 
@@ -138,7 +138,7 @@ async function productMatching(brands, projectId) {
             if (productLinks.length === 0 || productLinks.length > 0) {
                 try {
 
-                    const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}&refinementList%5Bmanufacturer%5D%5B0%5D=تيكنوم`;
+                    const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}&refinementList%5Bmanufacturer%5D%5B0%5D=تيكنوم&refinementList%5Bproduct_type_string%5D%5B0%5D=${encodeURIComponent(category || "")}`;
 
                     console.log("Retrying with Arabic URL:", url);
 
@@ -453,7 +453,7 @@ const config = require("./config.json");
 const { Op } = require('sequelize');
 
 app.post('/product-matching', async (req, res) => {
-    const { brand, projectId } = req.body;
+    const { brand, projectId, category } = req.body;
     console.log(brand)
     if (!brand || brand.length == 0 || !projectId) {
         return res.status(400).json({ error: "Brand and projectId are required parameters." });
@@ -463,7 +463,7 @@ app.post('/product-matching', async (req, res) => {
 
         res.status(200).json({ message: "Product matching started successfully." });
 
-        await productMatching(brand, projectId);
+        await productMatching(brand, projectId, category);
 
         console.log("Product matching completed successfully.");
     } catch (error) {
