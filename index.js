@@ -425,17 +425,17 @@ async function productMatching(brands, projectId, category) {
 
         await sendUpdateReportEmail(mailOptions);
 
-        if (fs.existsSync(outputFilePath)) {
-            fs.unlinkSync(outputFilePath);
-        }
+        // if (fs.existsSync(outputFilePath)) {
+        //     fs.unlinkSync(outputFilePath);
+        // }
 
-        if (fs.existsSync(errorFilePath)) {
-            fs.unlinkSync(errorFilePath);
-        }
+        // if (fs.existsSync(errorFilePath)) {
+        //     fs.unlinkSync(errorFilePath);
+        // }
 
-        if (fs.existsSync(matchedFilePath)) {
-            fs.unlinkSync(matchedFilePath);
-        }
+        // if (fs.existsSync(matchedFilePath)) {
+        //     fs.unlinkSync(matchedFilePath);
+        // }
         // }
 
         await browser.close();
