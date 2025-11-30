@@ -96,7 +96,7 @@ async function productMatching(brands, projectId, category) {
 
             const sourceProduct = sourceProducts[x];
 
-            const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}&refinementList%5Bproduct_type_string%5D%5B0%5D=${encodeURIComponent(category || "")}`;
+            const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}`;
 
             console.log(x, sourceProduct.title, url);
 
