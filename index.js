@@ -193,7 +193,7 @@ async function productMatching(brands, projectId, category) {
             if (productLinks.length === 0) {
                 console.log("No products found for:", sourceProduct.title);
 
-                await appendToFile("products_matching_errors.json", {
+                await appendToFile(errorFilePath, {
                     sourceProduct: sourceProduct,
                     error: "No products found"
                 });
