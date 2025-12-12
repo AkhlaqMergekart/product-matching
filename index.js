@@ -321,7 +321,7 @@ async function productMatching(brands, projectId, category) {
                 }
             } catch (error) {
                 console.log(error);
-                console.error("Error matching products:", JSON.stringify(error.response.data));
+                console.error("Error matching products:", error);
 
                 await appendToFile(errorFilePath, {
                     sourceProduct: sourceProduct,
