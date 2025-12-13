@@ -117,6 +117,7 @@ async function productMatching(brands, projectId, category) {
                         sourceProduct: sourceProduct,
                         error: "Max retries reached"
                     });
+                    retryCount = 0;
                     await page.close();
                     continue; // Skip to the next source product
                 } else {
