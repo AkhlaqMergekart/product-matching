@@ -47,6 +47,38 @@ function appendToFile(filename, data) {
     });
 }
 
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Block heavy resources we never use (we only parse the HTML), which drastically
+// reduces proxy bandwidth and the chance of a navigation hanging on slow assets.
+async function setupPage(page) {
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+        const blocked = ['image', 'media', 'font', 'stylesheet'];
+        if (blocked.includes(req.resourceType())) {
+            req.abort().catch(() => { });
+        } else {
+            req.continue().catch(() => { });
+        }
+    });
+}
+
+// Navigate using domcontentloaded (reliable) and then wait for the element we
+// actually need to be rendered, instead of relying on the fragile networkidle2.
+async function navigate(page, url, waitSelector, timeout = 60000) {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+    if (waitSelector) {
+        try {
+            await page.waitForSelector(waitSelector, { timeout: 15000 });
+        } catch (e) {
+            // Selector never appeared (e.g. no search results). Continue with
+            // whatever HTML is present and let the caller decide.
+        }
+    }
+}
+
 async function productMatching(brands, projectId, category) {
     try {
 
@@ -86,6 +118,7 @@ async function productMatching(brands, projectId, category) {
         console.log("Brand: ", sourceProducts[0].brand, "Source products count:", sourceProducts.length);
 
         let retryCount = 0;
+        let lastProcessedIndex = -1;
 
         const outputFilePath = `products_matched_final_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
         const errorFilePath = `products_matching_errors_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
@@ -96,6 +129,17 @@ async function productMatching(brands, projectId, category) {
 
             const sourceProduct = sourceProducts[x];
 
+            // Reset the retry counter only when we advance to a genuinely new
+            // product. Retries keep the same index (via x = x - 1), so this keeps
+            // the counter per-product instead of leaking across products.
+            if (x !== lastProcessedIndex) {
+                retryCount = 0;
+                lastProcessedIndex = x;
+            }
+
+            // Throttle between products to stay under proxy / site rate limits.
+            await delay(1500);
+
             const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}`;
 
             console.log(x, sourceProduct.title, url);
@@ -105,10 +149,11 @@ async function productMatching(brands, projectId, category) {
                 username: "ytsahlwj-rotate",
                 password: "9uud0ffubkrr"
             });
+            await setupPage(page);
             await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36");
 
             try {
-                await page.goto(url, { waitUntil: 'networkidle2', timeout: 120000 });
+                await navigate(page, url, "a.flex.h-full.flex-col", 60000);
             } catch (err) {
                 console.error("Error navigating to URL:", err);
                 retryCount++;
@@ -118,7 +163,6 @@ async function productMatching(brands, projectId, category) {
                         sourceProduct: sourceProduct,
                         error: "Max retries reached"
                     });
-                    retryCount = 0;
                     await page.close();
                     continue; // Skip to the next source product
                 } else {
@@ -145,7 +189,7 @@ async function productMatching(brands, projectId, category) {
                     console.log("Retrying with Arabic URL:", url);
 
                     try {
-                        await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+                        await navigate(page, url, "a.flex.h-full.flex-col", 60000);
                     } catch (err) {
                         console.error("Error navigating to Arabic URL:", err);
                         retryCount++;
@@ -185,12 +229,13 @@ async function productMatching(brands, projectId, category) {
                         sourceProduct: sourceProduct,
                         error: err.message
                     });
+                    await page.close().catch(() => { });
                     continue; // Skip to the next source product if there's an error
                 }
 
             }
 
-            await page.close();
+            await page.close().catch(() => { });
 
             if (productLinks.length === 0) {
                 console.log("No products found for:", sourceProduct.title);
@@ -206,20 +251,24 @@ async function productMatching(brands, projectId, category) {
             console.log("Found products:", productLinks.length);
 
             const productBatches = [];
+            // Process each product link
+            const productPage = await browser.newPage();
             try {
-                // Process each product link
-                const productPage = await browser.newPage();
+                await productPage.authenticate({
+                    username: "ytsahlwj-rotate",
+                    password: "9uud0ffubkrr"
+                });
+                await setupPage(productPage);
+                await productPage.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36");
 
                 for (let i = 0; i < productLinks.length; i++) {
                     const link = productLinks[i];
                     console.log("Processing link:", link);
 
-                    await productPage.authenticate({
-                        username: "ytsahlwj-rotate",
-                        password: "9uud0ffubkrr"
-                    });
+                    // Throttle between product detail requests.
+                    await delay(1000);
 
-                    await productPage.goto(link, { waitUntil: 'networkidle2', timeout: 60000 });
+                    await navigate(productPage, link, "h1", 60000);
 
                     const productResponse = await productPage.content();
 
@@ -258,7 +307,6 @@ async function productMatching(brands, projectId, category) {
                     productBatches.push(product);
 
                 }
-                await productPage.close();
 
             } catch (error) {
                 console.error("Error processing product links:", error);
@@ -269,6 +317,9 @@ async function productMatching(brands, projectId, category) {
                 });
 
                 continue; // Skip to the next source product if there's an error
+            } finally {
+                // Always close the page, even on error, to avoid leaking Chrome targets.
+                await productPage.close().catch(() => { });
             }
 
             if (productBatches.length === 0) {
