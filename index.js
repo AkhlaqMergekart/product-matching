@@ -68,15 +68,27 @@ async function setupPage(page) {
 // Navigate using domcontentloaded (reliable) and then wait for the element we
 // actually need to be rendered, instead of relying on the fragile networkidle2.
 async function navigate(page, url, waitSelector, timeout = 60000) {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+    const response = await page.goto(url, { waitUntil: 'networkidle2', timeout });
+
+    // IMPORTANT: page.goto does NOT throw on HTTP errors like 407 (proxy auth),
+    // 403, 429 or 5xx. Chrome happily renders an error page, which contains zero
+    // products. We must detect these and throw so the caller's retry logic runs
+    // (the rotating proxy gives a fresh IP/credentials on the next attempt).
+    const status = response ? response.status() : 0;
+    if (status === 0 || status === 407 || status === 403 || status === 429 || status >= 500) {
+        throw new Error(`Bad navigation status ${status} for ${url}`);
+    }
+
     if (waitSelector) {
         try {
             await page.waitForSelector(waitSelector, { timeout: 15000 });
         } catch (e) {
-            // Selector never appeared (e.g. no search results). Continue with
-            // whatever HTML is present and let the caller decide.
+            // Selector never appeared (e.g. genuinely no search results on a 200
+            // page). Continue with whatever HTML is present and let the caller decide.
         }
     }
+
+    return response;
 }
 
 async function productMatching(brands, projectId, category) {
@@ -174,7 +186,7 @@ async function productMatching(brands, projectId, category) {
             }
 
             const response = await page.content();
-
+            fs.writeFileSync("response.html", response);
             const $ = cheerio.load(response);
 
             const doc = new dom().parseFromString($.xml(), 'text/xml');
