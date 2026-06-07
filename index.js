@@ -163,7 +163,7 @@ async function productMatching(brands, projectId, category) {
                 if (retryCount >= 2) {
                     premium_level = "level_2";
                 }
-                    
+
                 let config = {
                     method: 'get',
                     maxBodyLength: Infinity,
@@ -213,12 +213,8 @@ async function productMatching(brands, projectId, category) {
             // Process each product link
             const productPage = await browser.newPage();
             try {
-                await productPage.authenticate({
-                    username: "ytsahlwj-rotate",
-                    password: "9uud0ffubkrr"
-                });
-                await setupPage(productPage);
-                await productPage.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36");
+
+                let premium_level = "level_1";
 
                 for (let i = 0; i < productLinks.length; i++) {
                     const link = productLinks[i];
@@ -227,9 +223,15 @@ async function productMatching(brands, projectId, category) {
                     // Throttle between product detail requests.
                     await delay(1000);
 
-                    await navigate(productPage, link, "h1", 60000);
+                    let config = {
+                        method: 'get',
+                        maxBodyLength: Infinity,
+                        url: `https://proxy.scrapeops.io/v1/?api_key=6aa09d27-c12a-49b1-9332-b0fe571795c2&url=${link}&render_js=true&premium=${premium_level}`,
+                        headers: {}
+                    };
 
-                    const productResponse = await productPage.content();
+                    const response = await axios.request(config);
+                    const productResponse = response.data;
 
                     const $ = cheerio.load(productResponse);
 
@@ -276,9 +278,6 @@ async function productMatching(brands, projectId, category) {
                 });
 
                 continue; // Skip to the next source product if there's an error
-            } finally {
-                // Always close the page, even on error, to avoid leaking Chrome targets.
-                await productPage.close().catch(() => { });
             }
 
             if (productBatches.length === 0) {
