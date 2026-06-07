@@ -161,11 +161,18 @@ async function productMatching(brands, projectId, category) {
                 username: "ytsahlwj-rotate",
                 password: "9uud0ffubkrr"
             });
-            await setupPage(page);
-            await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36");
 
+            let htmlResponse = null;
             try {
-                await navigate(page, url, "a.flex.h-full.flex-col", 60000);
+                let config = {
+                    method: 'get',
+                    maxBodyLength: Infinity,
+                    url: `https://proxy.scrapeops.io/v1/?api_key=6aa09d27-c12a-49b1-9332-b0fe571795c2&url=${url}&render_js=true&premium=level_1`,
+                    headers: {}
+                };
+
+                const response = await axios.request(config);
+                htmlResponse = response.data;
             } catch (err) {
                 console.error("Error navigating to URL:", err);
                 retryCount++;
@@ -185,9 +192,7 @@ async function productMatching(brands, projectId, category) {
 
             }
 
-            const response = await page.content();
-            fs.writeFileSync("response.html", response);
-            const $ = cheerio.load(response);
+            const $ = cheerio.load(htmlResponse);
 
             const doc = new dom().parseFromString($.xml(), 'text/xml');
 
