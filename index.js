@@ -156,18 +156,18 @@ async function productMatching(brands, projectId, category) {
 
             console.log(x, sourceProduct.title, url);
 
-            const page = await browser.newPage();
-            await page.authenticate({
-                username: "ytsahlwj-rotate",
-                password: "9uud0ffubkrr"
-            });
-
             let htmlResponse = null;
             try {
+                let premium_level = "level_1";
+
+                if (retryCount >= 2) {
+                    premium_level = "level_2";
+                }
+                    
                 let config = {
                     method: 'get',
                     maxBodyLength: Infinity,
-                    url: `https://proxy.scrapeops.io/v1/?api_key=6aa09d27-c12a-49b1-9332-b0fe571795c2&url=${url}&render_js=true&premium=level_1`,
+                    url: `https://proxy.scrapeops.io/v1/?api_key=6aa09d27-c12a-49b1-9332-b0fe571795c2&url=${url}&render_js=true&premium=${premium_level}`,
                     headers: {}
                 };
 
@@ -182,11 +182,9 @@ async function productMatching(brands, projectId, category) {
                         sourceProduct: sourceProduct,
                         error: "Max retries reached"
                     });
-                    await page.close();
                     continue; // Skip to the next source product
                 } else {
                     x = x - 1; // Decrement x to retry the current source product
-                    await page.close();
                     continue; // Skip to the next source product
                 }
 
@@ -197,62 +195,6 @@ async function productMatching(brands, projectId, category) {
             const doc = new dom().parseFromString($.xml(), 'text/xml');
 
             let productLinks = xpath.select("//a[@class='flex h-full flex-col']", doc).map(itm => "https://www.nahdionline.com" + itm.getAttribute("href"));
-
-            if (productLinks.length === 0 || productLinks.length > 0) {
-                try {
-
-                    const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}&refinementList%5Bmanufacturer%5D%5B0%5D=تيكنوم&refinementList%5Bproduct_type_string%5D%5B0%5D=${encodeURIComponent(category || "")}`;
-
-                    console.log("Retrying with Arabic URL:", url);
-
-                    try {
-                        await navigate(page, url, "a.flex.h-full.flex-col", 60000);
-                    } catch (err) {
-                        console.error("Error navigating to Arabic URL:", err);
-                        retryCount++;
-
-                        if (retryCount >= 3) {
-                            console.error("Max retries reached for source product:", sourceProduct.title);
-                            await appendToFile(errorFilePath, {
-                                sourceProduct: sourceProduct,
-                                error: "Max retries reached"
-                            });
-                            await page.close();
-                            continue; // Skip to the next source product
-                        } else {
-                            x = x - 1; // Decrement x to retry the current source product
-                            await page.close();
-                            continue; // Skip to the next source product
-                        }
-
-
-                    }
-
-                    const response = await page.content();
-
-                    const $ = cheerio.load(response);
-
-                    const doc = new dom().parseFromString($.xml(), 'text/xml');
-
-                    const productLinksArab = xpath.select("//a[@class='flex h-full flex-col']", doc).map(itm => "https://www.nahdionline.com" + itm.getAttribute("href"));
-
-                    if (productLinksArab.length > 0) {
-                        productLinks = productLinks.concat(productLinksArab);
-                    }
-
-                } catch (err) {
-                    console.error("Error fetching product links:", err);
-                    await appendToFile(errorFilePath, {
-                        sourceProduct: sourceProduct,
-                        error: err.message
-                    });
-                    await page.close().catch(() => { });
-                    continue; // Skip to the next source product if there's an error
-                }
-
-            }
-
-            await page.close().catch(() => { });
 
             if (productLinks.length === 0) {
                 console.log("No products found for:", sourceProduct.title);
