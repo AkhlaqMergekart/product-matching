@@ -455,6 +455,14 @@ async function productMatching(brands, projectId, category) {
 
     } catch (err) {
         console.error("Error:", err);
+        const mailOptions = {
+            from: config.FROM_EMAIL,
+            to: "akhlaq@mergekart.com",
+            subject: `Product Matching Error for ${brands.join(", ")} - ${projectId}`,
+            text: `An error occurred during product matching for brand: ${brands.join(", ")} and projectId: ${projectId}. Error: ${err.message}`,
+        };
+
+        await sendUpdateReportEmail(mailOptions);
     }
 }
 
