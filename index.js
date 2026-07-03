@@ -240,8 +240,8 @@ async function productMatching(brands, projectId, category) {
                     const category = xpath.select("//ul[@class='flex items-center text-custom-xs font-semibold text-gray ']/li", doc)?.map(itm => itm.textContent).join(" > ");
                     const brand = xpath.select("//div[@class='flex items-center space-x-2 empty:hidden rtl:space-x-reverse']", doc)?.[0]?.textContent;
                     const title = xpath.select("//h1", doc)?.[0]?.textContent;
-                    const price = xpath.select("//div[@class='text-primary-red']", doc)?.[0]?.textContent;
-                    const mrp = xpath.select("//span[@class='font-montserrat']", doc)?.[0]?.textContent
+                    const price = xpath.select("//div[@class='flex items-center text-primary-red']", doc)?.[0]?.textContent;
+                    const mrp = xpath.select("//div[@class='items-center mx-2 flex text-lg text-gray-500 line-through']", doc)?.[0]?.textContent
                     const express = xpath.select("//div[@class='ms-1 flex min-w-fit flex-row']/img", doc).length > 0 ? true : false;
                     const description = xpath.select("//div[@class='pdp-about-section']", doc);
                     const totalRating = xpath.select("//span[@class='flex items-center gap-2 text-2xl font-semibold']", doc)?.[0]?.textContent;
