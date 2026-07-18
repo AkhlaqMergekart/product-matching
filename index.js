@@ -214,8 +214,6 @@ async function productMatching(brands, projectId, category) {
             const productPage = await browser.newPage();
             try {
 
-                let premium_level = "level_1";
-
                 for (let i = 0; i < productLinks.length; i++) {
                     const link = productLinks[i];
                     console.log("Processing link:", link);
@@ -223,15 +221,44 @@ async function productMatching(brands, projectId, category) {
                     // Throttle between product detail requests.
                     await delay(1000);
 
-                    let config = {
-                        method: 'get',
-                        maxBodyLength: Infinity,
-                        url: `https://proxy.scrapeops.io/v1/?api_key=6aa09d27-c12a-49b1-9332-b0fe571795c2&url=${link}&render_js=true&premium=${premium_level}`,
-                        headers: {}
-                    };
+                    // Retry this single link up to 3 times (escalating to premium
+                    // rendering after the first failure) instead of letting a
+                    // transient proxy error (e.g. 502) abort the entire batch.
+                    let productResponse = null;
+                    let linkError = null;
+                    for (let attempt = 1; attempt <= 3; attempt++) {
+                        try {
+                            const premium_level = attempt >= 2 ? "level_2" : "level_1";
 
-                    const response = await axios.request(config);
-                    const productResponse = response.data;
+                            let config = {
+                                method: 'get',
+                                maxBodyLength: Infinity,
+                                url: `https://proxy.scrapeops.io/v1/?api_key=6aa09d27-c12a-49b1-9332-b0fe571795c2&url=${link}&render_js=true&premium=${premium_level}`,
+                                headers: {}
+                            };
+
+                            const response = await axios.request(config);
+                            productResponse = response.data;
+                            linkError = null;
+                            break;
+                        } catch (err) {
+                            linkError = err;
+                            console.error(`Error fetching product link (attempt ${attempt}/3):`, link, err.message);
+                            if (attempt < 3) {
+                                await delay(1000);
+                            }
+                        }
+                    }
+
+                    if (linkError) {
+                        console.error("Max retries reached for product link:", link);
+                        await appendToFile(errorFilePath, {
+                            sourceProduct: sourceProduct,
+                            link: link,
+                            error: linkError.message
+                        });
+                        continue; // Skip this link, keep processing the rest of the batch
+                    }
 
                     const $ = cheerio.load(productResponse);
 
