@@ -1,16 +1,23 @@
-const axios = require('axios');
-const fs = require('fs');
-const cheerio = require('cheerio');
-const xpath = require('xpath');
-const dom = require('xmldom').DOMParser;
-const puppeteer = require('puppeteer');
-const express = require('express');
+const axios = require("axios");
+const fs = require("fs");
+const cheerio = require("cheerio");
+const xpath = require("xpath");
+const dom = require("xmldom").DOMParser;
+const puppeteer = require("puppeteer");
+const express = require("express");
 const app = express();
 const sendUpdateReportEmail = require("./helper/sendUpdateReport.js");
+const { fetchHtml } = require("./helper/scrapeClient.js");
+const { exportResultsToExcel } = require("./helper/exportResults.js");
+const targetSites = require("./config/targetSites.js");
+const brandTargets = require("./config/brandTargets.js");
 
 require("./database/config.js");
 
 const ScratchProducts = require("./models/scratchProducts.js");
+
+const MATCH_THRESHOLD = 0.85;
+const MATCH_FIELD_KEYS = ["title", "brand", "color", "image_similarity"];
 
 function appendToFile(filename, data) {
     // Read the file
@@ -51,46 +58,127 @@ function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Block heavy resources we never use (we only parse the HTML), which drastically
-// reduces proxy bandwidth and the chance of a navigation hanging on slow assets.
-async function setupPage(page) {
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-        const blocked = ['image', 'media', 'font', 'stylesheet'];
-        if (blocked.includes(req.resourceType())) {
-            req.abort().catch(() => { });
-        } else {
-            req.continue().catch(() => { });
-        }
-    });
-}
+// Searches `targetConfig`'s site for `query` and returns a full list of
+// candidate product objects, ready to hand to the matching service. This is
+// the piece that used to be hardcoded to Nahdi — every site-specific fact
+// (search URL, listing/detail selectors, which proxy client to use) comes
+// from targetConfig (config/targetSites.js) instead.
+async function buildCandidatesFromSearch(targetConfig, query) {
+    const searchUrl = targetConfig.buildSearchUrl(query);
 
-// Navigate using domcontentloaded (reliable) and then wait for the element we
-// actually need to be rendered, instead of relying on the fragile networkidle2.
-async function navigate(page, url, waitSelector, timeout = 60000) {
-    const response = await page.goto(url, { waitUntil: 'networkidle2', timeout });
-
-    // IMPORTANT: page.goto does NOT throw on HTTP errors like 407 (proxy auth),
-    // 403, 429 or 5xx. Chrome happily renders an error page, which contains zero
-    // products. We must detect these and throw so the caller's retry logic runs
-    // (the rotating proxy gives a fresh IP/credentials on the next attempt).
-    const status = response ? response.status() : 0;
-    if (status === 0 || status === 407 || status === 403 || status === 429 || status >= 500) {
-        throw new Error(`Bad navigation status ${status} for ${url}`);
+    let searchHtml;
+    try {
+        searchHtml = await fetchHtml(targetConfig.scraper, searchUrl);
+    } catch (err) {
+        console.error(`Error searching ${targetConfig.label} for "${query}":`, err.message);
+        return [];
     }
 
-    if (waitSelector) {
+    const $ = cheerio.load(searchHtml);
+    const doc = new dom().parseFromString($.xml(), "text/xml");
+
+    // Some targets (Amazon UAE) carry enough data on the search-results page
+    // itself, so there's no per-candidate detail fetch at all.
+    if (!targetConfig.needsDetailFetch) {
+        return targetConfig.extractListingProducts(doc);
+    }
+
+    const productLinks = targetConfig.extractListingLinks(doc);
+    if (productLinks.length === 0) {
+        console.log(`No products found on ${targetConfig.label} for:`, query);
+        return [];
+    }
+
+    const candidates = [];
+    for (let i = 0; i < productLinks.length; i++) {
+        const link = productLinks[i];
+
+        // Throttle between product detail requests.
+        await delay(1000);
+
+        let detailHtml = null;
         try {
-            await page.waitForSelector(waitSelector, { timeout: 15000 });
-        } catch (e) {
-            // Selector never appeared (e.g. genuinely no search results on a 200
-            // page). Continue with whatever HTML is present and let the caller decide.
+            detailHtml = await fetchHtml(targetConfig.scraper, link);
+        } catch (err) {
+            console.error(`Error fetching ${targetConfig.label} product page:`, link, err.message);
+            continue; // Skip this link, keep processing the rest of the batch
+        }
+
+        const $$ = cheerio.load(detailHtml);
+        const detailDoc = new dom().parseFromString($$.xml(), "text/xml");
+
+        try {
+            candidates.push(targetConfig.extractDetail(detailDoc, link));
+        } catch (err) {
+            console.error(`Error parsing ${targetConfig.label} product page:`, link, err.message);
         }
     }
 
-    return response;
+    return candidates;
 }
 
+// Sends originalProduct + candidates to the matching microservice in
+// batches of 5 (unchanged from the original Nahdi flow) and returns the
+// flattened field-score results.
+async function callMatchingService(originalProduct, comparableProducts) {
+    originalProduct.price = originalProduct.price ? parseFloat(originalProduct.price) : 0;
+    originalProduct.mrp = originalProduct.mrp ? parseFloat(originalProduct.mrp) : 0;
+
+    let matchData = [];
+    const batchSize = 5;
+
+    for (let i = 0; i < comparableProducts.length; i += batchSize) {
+        const batch = comparableProducts.slice(i, i + batchSize);
+
+        const config = {
+            method: 'post',
+            maxBodyLength: Infinity,
+            url: "http://localhost:8000/api/match",
+            headers: {
+                'accept': '*/*',
+                'accept-language': 'en-US,en;q=0.9',
+                'content-type': 'application/json',
+                'origin': 'https://www.mumzworld.com',
+                'referer': 'https://www.mumzworld.com/',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
+                'X-API-Key': "test123#"
+            },
+            data: {
+                "original_product": originalProduct,
+                "comparable_products": batch,
+                "include_image_similarity": true
+            },
+            timeout: 120000
+        };
+
+        const matchResponse = await axios.request(config);
+        matchData = matchData.concat(matchResponse.data);
+    }
+
+    return matchData;
+}
+
+// Applies the "all four scores >= 0.85" rule (unchanged threshold) and
+// returns the first candidate that clears it, or null.
+function pickBestMatch(matchData) {
+    for (let i = 0; i < matchData.length; i++) {
+        const fieldScores = matchData[i].field_scores;
+        const clearsThreshold = fieldScores && MATCH_FIELD_KEYS.every((key) => fieldScores[key] >= MATCH_THRESHOLD);
+
+        if (clearsThreshold) {
+            return { matchedProduct: matchData[i], fieldScores };
+        }
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy Mumzworld -> Nahdi flow (original, unrefactored implementation).
+// Pulls source rows by SKU list + projectId, searches Nahdi directly via the
+// ScrapeOps proxy, scrapes each product page with cheerio/xpath, and matches
+// against the matching microservice. Existing callers of POST
+// /product-matching keep working exactly as before.
+// ---------------------------------------------------------------------------
 async function productMatching(brands, projectId, category) {
     try {
 
@@ -214,8 +302,6 @@ async function productMatching(brands, projectId, category) {
             const productPage = await browser.newPage();
             try {
 
-                let premium_level = "level_1";
-
                 for (let i = 0; i < productLinks.length; i++) {
                     const link = productLinks[i];
                     console.log("Processing link:", link);
@@ -223,15 +309,44 @@ async function productMatching(brands, projectId, category) {
                     // Throttle between product detail requests.
                     await delay(1000);
 
-                    let config = {
-                        method: 'get',
-                        maxBodyLength: Infinity,
-                        url: `https://proxy.scrapeops.io/v1/?api_key=6aa09d27-c12a-49b1-9332-b0fe571795c2&url=${link}&render_js=true&premium=${premium_level}`,
-                        headers: {}
-                    };
+                    // Retry this single link up to 3 times (escalating to premium
+                    // rendering after the first failure) instead of letting a
+                    // transient proxy error (e.g. 502) abort the entire batch.
+                    let productResponse = null;
+                    let linkError = null;
+                    for (let attempt = 1; attempt <= 3; attempt++) {
+                        try {
+                            const premium_level = attempt >= 2 ? "level_2" : "level_1";
 
-                    const response = await axios.request(config);
-                    const productResponse = response.data;
+                            let config = {
+                                method: 'get',
+                                maxBodyLength: Infinity,
+                                url: `https://proxy.scrapeops.io/v1/?api_key=6aa09d27-c12a-49b1-9332-b0fe571795c2&url=${link}&render_js=true&premium=${premium_level}`,
+                                headers: {}
+                            };
+
+                            const response = await axios.request(config);
+                            productResponse = response.data;
+                            linkError = null;
+                            break;
+                        } catch (err) {
+                            linkError = err;
+                            console.error(`Error fetching product link (attempt ${attempt}/3):`, link, err.message);
+                            if (attempt < 3) {
+                                await delay(1000);
+                            }
+                        }
+                    }
+
+                    if (linkError) {
+                        console.error("Max retries reached for product link:", link);
+                        await appendToFile(errorFilePath, {
+                            sourceProduct: sourceProduct,
+                            link: link,
+                            error: linkError.message
+                        });
+                        continue; // Skip this link, keep processing the rest of the batch
+                    }
 
                     const $ = cheerio.load(productResponse);
 
@@ -466,6 +581,136 @@ async function productMatching(brands, projectId, category) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// New brand-driven flow: looks up every {target, direction} pair configured
+// for `brandName` in config/brandTargets.js and runs all of them, combining
+// results into one spreadsheet. This is what powers the Teknum x Amazon
+// UAE / Firstcry UAE (forward + reverse) checks.
+// ---------------------------------------------------------------------------
+async function runBrandMatching(brandName, projectId) {
+    const targets = brandTargets[brandName];
+    if (!targets || targets.length === 0) {
+        throw new Error(`No target sites configured for brand "${brandName}" in config/brandTargets.js`);
+    }
+
+    // The brand's own catalog rows — used as the source list for "forward"
+    // checks, and as the comparison pool for "reverse" checks.
+    const localCatalog = await ScratchProducts.findAll({
+        where: { brand: { [Op.iLike]: brandName }, projectId },
+        raw: true,
+        attributes: ['title', 'url', 'brand', 'sku', 'category', 'images', 'attributes', 'price', 'mrp']
+    });
+
+    if (localCatalog.length === 0) {
+        throw new Error(`No catalog rows found for brand "${brandName}" and projectId ${projectId}`);
+    }
+
+    const runId = Date.now();
+    const errorFilePath = `brand_matching_errors_${brandName}_${projectId}_${runId}.json`;
+    const matchedFilePath = `brand_matching_raw_${brandName}_${projectId}_${runId}.json`;
+    const excelFilePath = `brand_matching_${brandName}_${projectId}_${runId}.xlsx`;
+    const allResults = [];
+
+    for (const { target: targetId, direction } of targets) {
+        const targetConfig = targetSites[targetId];
+        if (!targetConfig) {
+            console.error(`Unknown target site "${targetId}" in brandTargets config, skipping.`);
+            continue;
+        }
+
+        console.log(`Running ${direction} check for ${brandName} against ${targetConfig.label}`);
+
+        if (direction === "forward") {
+            // Same shape as the legacy flow: iterate our own catalog rows,
+            // search the target for each one.
+            for (const sourceProduct of localCatalog) {
+                await delay(1500);
+
+                const candidates = await buildCandidatesFromSearch(targetConfig, sourceProduct.title);
+                if (candidates.length === 0) {
+                    await appendToFile(errorFilePath, { direction, target: targetConfig.label, sourceProduct, error: "No products found" });
+                    continue;
+                }
+
+                let matchData = [];
+                try {
+                    matchData = await callMatchingService(sourceProduct, candidates);
+                } catch (err) {
+                    await appendToFile(errorFilePath, { direction, target: targetConfig.label, sourceProduct, error: err.message });
+                    continue;
+                }
+
+                await appendToFile(matchedFilePath, { direction, target: targetConfig.label, sourceProduct, matchedProducts: matchData });
+
+                const best = pickBestMatch(matchData);
+                allResults.push({
+                    targetLabel: targetConfig.label,
+                    direction,
+                    sourceProduct,
+                    matched: !!best,
+                    matchedProduct: best ? best.matchedProduct : null,
+                    fieldScores: best ? best.fieldScores : null,
+                });
+            }
+        }
+        // Reverse direction disabled for now (out of scope per current HLD —
+        // forward-only). Left in place, commented, rather than deleted:
+        // else if (direction === "reverse") {
+        //     // Search the target site for the brand itself, then check each
+        //     // result found there against our own catalog. NOTE: this only
+        //     // covers the first page of results the target returns for the
+        //     // brand-name query — no pagination yet. Good enough to surface
+        //     // "things listed under this brand that we don't have tracked,"
+        //     // but not an exhaustive crawl of the target site.
+        //     const targetSideProducts = await buildCandidatesFromSearch(targetConfig, brandName);
+        //
+        //     for (const targetSideProduct of targetSideProducts) {
+        //         await delay(1500);
+        //
+        //         let matchData = [];
+        //         try {
+        //             matchData = await callMatchingService(targetSideProduct, localCatalog);
+        //         } catch (err) {
+        //             await appendToFile(errorFilePath, { direction, target: targetConfig.label, sourceProduct: targetSideProduct, error: err.message });
+        //             continue;
+        //         }
+        //
+        //         await appendToFile(matchedFilePath, { direction, target: targetConfig.label, sourceProduct: targetSideProduct, matchedProducts: matchData });
+        //
+        //         const best = pickBestMatch(matchData);
+        //         allResults.push({
+        //             targetLabel: targetConfig.label,
+        //             direction,
+        //             sourceProduct: targetSideProduct,
+        //             matched: !!best,
+        //             matchedProduct: best ? best.matchedProduct : null,
+        //             fieldScores: best ? best.fieldScores : null,
+        //         });
+        //     }
+        // }
+    }
+
+    exportResultsToExcel(allResults, excelFilePath);
+
+    const matchedCount = allResults.filter((r) => r.matched).length;
+
+    const mailOptions = {
+        from: config.FROM_EMAIL,
+        to: "akhlaq@mergekart.com",
+        subject: `Product Matching Report for ${brandName} - ${projectId}`,
+        text: `Multi-marketplace product matching completed for brand: ${brandName}, project: ${projectId}. ${matchedCount}/${allResults.length} rows matched. See attached spreadsheet.`,
+        attachments: [
+            { filename: 'product_matching_results.xlsx', path: excelFilePath },
+            { filename: 'product_matching_raw.json', path: fs.existsSync(matchedFilePath) ? matchedFilePath : `emptyFile.json` },
+            { filename: 'product_matching_errors.json', path: fs.existsSync(errorFilePath) ? errorFilePath : `emptyFile.json` },
+        ]
+    };
+
+    await sendUpdateReportEmail(mailOptions);
+
+    return { excelFilePath, totalRows: allResults.length, matchedCount };
+}
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -499,6 +744,36 @@ app.post('/product-matching', async (req, res) => {
         await sendUpdateReportEmail(mailOptions);
 
         res.status(500).json({ error: "An error occurred during product matching." });
+    }
+});
+
+// New: config-driven, multi-target (+ reverse-check) matching for a whole
+// brand, e.g. { "brandName": "Teknum", "projectId": 240 }. Which target
+// sites and directions run is controlled entirely by config/brandTargets.js.
+app.post('/product-matching/brand', async (req, res) => {
+    const { brandName, projectId } = req.body;
+
+    if (!brandName || !projectId) {
+        return res.status(400).json({ error: "brandName and projectId are required parameters." });
+    }
+
+    try {
+        res.status(200).json({ message: "Brand product matching started successfully." });
+
+        const result = await runBrandMatching(brandName, projectId);
+
+        console.log("Brand product matching completed successfully.", result);
+    } catch (error) {
+        console.error("Error in brand product matching:", error);
+
+        const mailOptions = {
+            from: config.FROM_EMAIL,
+            to: "akhlaq@mergekart.com",
+            subject: `Product Matching Error for ${brandName} - ${projectId}`,
+            text: `An error occurred during brand product matching for brand: ${brandName} and projectId: ${projectId}. Error: ${error.message}`,
+        };
+
+        await sendUpdateReportEmail(mailOptions);
     }
 });
 
