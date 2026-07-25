@@ -18,6 +18,7 @@ const ScratchProducts = require("./models/scratchProducts.js");
 
 const MATCH_THRESHOLD = 0.85;
 const MATCH_FIELD_KEYS = ["title", "brand", "color", "image_similarity"];
+const MATCHING_SERVICE_URL = "http://localhost:8000/api/match";
 
 function appendToFile(filename, data) {
     // Read the file
@@ -133,7 +134,7 @@ async function callMatchingService(originalProduct, comparableProducts) {
         const config = {
             method: 'post',
             maxBodyLength: Infinity,
-            url: "http://localhost:8000/api/match",
+            url: MATCHING_SERVICE_URL,
             headers: {
                 'accept': '*/*',
                 'accept-language': 'en-US,en;q=0.9',
@@ -427,7 +428,7 @@ async function productMatching(brands, projectId, category) {
                     const config = {
                         method: 'post',
                         maxBodyLength: Infinity,
-                        url: "http://localhost:8000/api/match",
+                        url: MATCHING_SERVICE_URL,
                         headers: {
                             'accept': '*/*',
                             'accept-language': 'en-US,en;q=0.9',
