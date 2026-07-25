@@ -88,7 +88,7 @@ const targetSites = {
       const links = xpath.select("//div[contains(@class,'lblock')]//a[@href][1]", doc);
       return links
         .map((a) => a.getAttribute("href"))
-        .filter(Boolean)
+        .filter((href) => Boolean(href) && !/^\s*(javascript:|#)/i.test(href))
         .map((href) => {
           if (href.startsWith("//")) return `https:${href}`;
           if (href.startsWith("http")) return href;
