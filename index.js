@@ -587,22 +587,32 @@ async function productMatching(brands, projectId, category) {
 // results into one spreadsheet. This is what powers the Teknum x Amazon
 // UAE / Firstcry UAE (forward + reverse) checks.
 // ---------------------------------------------------------------------------
-async function runBrandMatching(brandName, projectId) {
+async function runBrandMatching(brandName, projectId, skus = null) {
     const targets = brandTargets[brandName];
     if (!targets || targets.length === 0) {
         throw new Error(`No target sites configured for brand "${brandName}" in config/brandTargets.js`);
     }
 
     // The brand's own catalog rows — used as the source list for "forward"
-    // checks, and as the comparison pool for "reverse" checks.
+    // checks, and as the comparison pool for "reverse" checks. An optional
+    // `skus` list narrows this to specific products (e.g. a 10-product test
+    // run). It only selects WHICH of our own rows to process — the target
+    // sites are still searched by product title, not by SKU (a Mumzworld SKU
+    // means nothing on Amazon UAE / Firstcry UAE).
+    const where = { brand: { [Op.iLike]: brandName }, projectId };
+    if (Array.isArray(skus) && skus.length > 0) {
+        where.sku = { [Op.in]: skus.map((s) => String(s)) };
+    }
+
     const localCatalog = await ScratchProducts.findAll({
-        where: { brand: { [Op.iLike]: brandName }, projectId },
+        where,
         raw: true,
         attributes: ['title', 'url', 'brand', 'sku', 'category', 'images', 'attributes', 'price', 'mrp']
     });
 
     if (localCatalog.length === 0) {
-        throw new Error(`No catalog rows found for brand "${brandName}" and projectId ${projectId}`);
+        const skuNote = Array.isArray(skus) && skus.length > 0 ? ` and skus [${skus.join(", ")}]` : "";
+        throw new Error(`No catalog rows found for brand "${brandName}" and projectId ${projectId}${skuNote}`);
     }
 
     const runId = Date.now();
@@ -748,19 +758,25 @@ app.post('/product-matching', async (req, res) => {
 });
 
 // New: config-driven, multi-target (+ reverse-check) matching for a whole
-// brand, e.g. { "brandName": "Teknum", "projectId": 240 }. Which target
+// brand, e.g. { "brandName": "Teknum", "projectId": 342 }. Which target
 // sites and directions run is controlled entirely by config/brandTargets.js.
+// Optionally pass "skus": ["...", "..."] to limit the run to specific products
+// (e.g. a 10-product test); omit it to process the brand's whole catalog.
 app.post('/product-matching/brand', async (req, res) => {
-    const { brandName, projectId } = req.body;
+    const { brandName, projectId, skus } = req.body;
 
     if (!brandName || !projectId) {
         return res.status(400).json({ error: "brandName and projectId are required parameters." });
     }
 
+    if (skus !== undefined && !Array.isArray(skus)) {
+        return res.status(400).json({ error: "skus, if provided, must be an array of SKU strings." });
+    }
+
     try {
         res.status(200).json({ message: "Brand product matching started successfully." });
 
-        const result = await runBrandMatching(brandName, projectId);
+        const result = await runBrandMatching(brandName, projectId, skus);
 
         console.log("Brand product matching completed successfully.", result);
     } catch (error) {
