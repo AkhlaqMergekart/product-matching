@@ -59,6 +59,58 @@ function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Second pass for targets whose listing grid is *mostly* complete but drops a
+// field on some cards. Fetches the product page for only those candidates,
+// rather than making every candidate pay for the few that are short.
+// Driven entirely by targetConfig.brandFallback — targets without it (Nahdi,
+// Firstcry UAE) are untouched.
+async function enrichMissingBrands(targetConfig, candidates) {
+    const cfg = targetConfig.brandFallback;
+    if (!cfg) return candidates;
+
+    const gaps = candidates.filter((c) => cfg.needed(c));
+    if (gaps.length === 0) return candidates;
+
+    const limit = cfg.maxFetches ?? gaps.length;
+    const toFetch = gaps.slice(0, limit);
+
+    console.log(
+        `  ${targetConfig.label}: ${gaps.length}/${candidates.length} candidates missing brand` +
+        `, fetching ${toFetch.length} product page(s) to fill them in` +
+        (gaps.length > toFetch.length ? ` (capped at ${limit})` : "")
+    );
+
+    // Cache by URL so repeated ASINs in one result set cost one fetch.
+    const seen = new Map();
+
+    for (const candidate of toFetch) {
+        const url = cfg.buildUrl(candidate);
+        if (!url) continue;
+
+        if (seen.has(url)) {
+            candidate.brand = seen.get(url);
+            continue;
+        }
+
+        await delay(1000);
+
+        try {
+            const html = await fetchHtml(targetConfig.scraper, url, cfg.scraperOptions || targetConfig.scraperOptions);
+            const $ = cheerio.load(html);
+            const brand = cfg.extract(new dom().parseFromString($.xml(), "text/xml")) || "";
+            seen.set(url, brand);
+            candidate.brand = brand;
+        } catch (err) {
+            // A failed top-up is not fatal — the candidate just keeps its blank
+            // brand and will score 0 on that gate, exactly as it would have
+            // without this pass at all.
+            console.error(`  brand fallback failed for ${url}:`, err.message);
+        }
+    }
+
+    return candidates;
+}
+
 // Searches `targetConfig`'s site for `query` and returns a full list of
 // candidate product objects, ready to hand to the matching service. This is
 // the piece that used to be hardcoded to Nahdi — every site-specific fact
@@ -69,7 +121,7 @@ async function buildCandidatesFromSearch(targetConfig, query) {
 
     let searchHtml;
     try {
-        searchHtml = await fetchHtml(targetConfig.scraper, searchUrl);
+        searchHtml = await fetchHtml(targetConfig.scraper, searchUrl, targetConfig.scraperOptions);
     } catch (err) {
         console.error(`Error searching ${targetConfig.label} for "${query}":`, err.message);
         return [];
@@ -81,7 +133,8 @@ async function buildCandidatesFromSearch(targetConfig, query) {
     // Some targets (Amazon UAE) carry enough data on the search-results page
     // itself, so there's no per-candidate detail fetch at all.
     if (!targetConfig.needsDetailFetch) {
-        return targetConfig.extractListingProducts(doc);
+        const candidates = targetConfig.extractListingProducts(doc);
+        return enrichMissingBrands(targetConfig, candidates);
     }
 
     const productLinks = targetConfig.extractListingLinks(doc);
@@ -99,7 +152,7 @@ async function buildCandidatesFromSearch(targetConfig, query) {
 
         let detailHtml = null;
         try {
-            detailHtml = await fetchHtml(targetConfig.scraper, link);
+            detailHtml = await fetchHtml(targetConfig.scraper, link, targetConfig.scraperOptions);
         } catch (err) {
             console.error(`Error fetching ${targetConfig.label} product page:`, link, err.message);
             continue; // Skip this link, keep processing the rest of the batch
@@ -167,7 +220,20 @@ function pickBestMatch(matchData) {
         const clearsThreshold = fieldScores && MATCH_FIELD_KEYS.every((key) => fieldScores[key] >= MATCH_THRESHOLD);
 
         if (clearsThreshold) {
-            return { matchedProduct: matchData[i], fieldScores };
+            // Unwrap to the product itself. The matching service returns each
+            // candidate inside a score envelope —
+            //   { product: {...}, composite_score, field_scores, ... }
+            // — and this used to hand back that whole envelope as
+            // `matchedProduct`. helper/exportResults.js then read .title/.url/
+            // .price straight off it, one level too shallow, so a candidate
+            // that PASSED all four gates produced a spreadsheet row reading
+            // "Matched: Yes" with blank title, URL and price. Invisible so far
+            // only because nothing has ever passed.
+            //
+            // Nothing is lost by unwrapping here: the full envelope for every
+            // candidate is already written to the raw JSON further down.
+            const matchedProduct = matchData[i].product || matchData[i];
+            return { matchedProduct, fieldScores };
         }
     }
     return null;
@@ -785,7 +851,7 @@ app.post('/product-matching/brand', async (req, res) => {
 
         const mailOptions = {
             from: config.FROM_EMAIL,
-            to: "akhlaq@mergekart.com",
+            to: "anushidh@mergekart.com",
             subject: `Product Matching Error for ${brandName} - ${projectId}`,
             text: `An error occurred during brand product matching for brand: ${brandName} and projectId: ${projectId}. Error: ${error.message}`,
         };
