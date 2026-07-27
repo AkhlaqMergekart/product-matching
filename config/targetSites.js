@@ -286,7 +286,9 @@ const targetSites = {
           : 0;
 
         return {
-          url: asin ? `https://www.amazon.ae/dp/${asin}` : "",
+          // "/-/en/" for the same reason as buildSearchUrl above: without it
+          // a click-through from the exported sheet lands on the Arabic page.
+          url: asin ? `https://www.amazon.ae/-/en/dp/${asin}` : "",
           category: "",
           // Previously hardcoded "" on the assumption brand wasn't on the
           // search grid, which zeroed the brand gate for all 479 candidates
