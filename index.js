@@ -3,11 +3,11 @@ const fs = require("fs");
 const cheerio = require("cheerio");
 const xpath = require("xpath");
 const dom = require("xmldom").DOMParser;
-const puppeteer = require("puppeteer");
 const express = require("express");
 const app = express();
 const sendUpdateReportEmail = require("./helper/sendUpdateReport.js");
 const { fetchHtml } = require("./helper/scrapeClient.js");
+const { fetchViaBrowser, closeBrowser } = require("./helper/browserClient.js");
 const { exportResultsToExcel } = require("./helper/exportResults.js");
 const targetSites = require("./config/targetSites.js");
 const brandTargets = require("./config/brandTargets.js");
@@ -241,9 +241,9 @@ function pickBestMatch(matchData) {
 
 // ---------------------------------------------------------------------------
 // Legacy Mumzworld -> Nahdi flow (original, unrefactored implementation).
-// Pulls source rows by SKU list + projectId, searches Nahdi directly via the
-// ScrapeOps proxy, scrapes each product page with cheerio/xpath, and matches
-// against the matching microservice. Existing callers of POST
+// Pulls source rows by SKU list + projectId, searches Nahdi in a headless
+// browser via the Webshare proxy, scrapes each product page with
+// cheerio/xpath, and matches against the matching microservice. Existing callers of POST
 // /product-matching keep working exactly as before.
 // ---------------------------------------------------------------------------
 async function productMatching(brands, projectId, category) {
@@ -256,15 +256,11 @@ async function productMatching(brands, projectId, category) {
             throw new Error("Brand and projectId are required parameters.");
         }
 
-        const browser = await puppeteer.launch({
-            args: [
-                "--no-sandbox",
-                "--proxy-server=http://p.webshare.io:80",
-                "--disabled-setupid-sandbox",
-            ],
-            headless: true,
-            waitForInitialPage: 10000,
-        });
+        // The browser is launched (and the Webshare proxy authenticated)
+        // lazily by helper/browserClient.js on the first fetch below. This
+        // used to launch its own instance here with the same proxy but no
+        // page.authenticate() call, so every request through it would have
+        // been met with an unanswered proxy auth challenge.
 
         // for (var z = 0; z < brands.length; z++) {
 
@@ -313,21 +309,12 @@ async function productMatching(brands, projectId, category) {
 
             let htmlResponse = null;
             try {
-                let premium_level = "level_1";
-
-                if (retryCount >= 2) {
-                    premium_level = "level_2";
-                }
-
-                let config = {
-                    method: 'get',
-                    maxBodyLength: Infinity,
-                    url: `https://proxy.scrapeops.io/v1/?api_key=6aa09d27-c12a-49b1-9332-b0fe571795c2&url=${url}&render_js=true&premium=${premium_level}`,
-                    headers: {}
-                };
-
-                const response = await axios.request(config);
-                htmlResponse = response.data;
+                // One attempt per pass — the retryCount loop below is what
+                // retries, exactly as it did when this escalated ScrapeOps'
+                // premium tier on retryCount >= 2. There's no tier to
+                // escalate now; a retry gets a fresh browser context and
+                // therefore a fresh rotating exit IP instead.
+                htmlResponse = await fetchViaBrowser(url);
             } catch (err) {
                 console.error("Error navigating to URL:", err);
                 retryCount++;
@@ -365,8 +352,10 @@ async function productMatching(brands, projectId, category) {
             console.log("Found products:", productLinks.length);
 
             const productBatches = [];
-            // Process each product link
-            const productPage = await browser.newPage();
+            // Process each product link. (A per-source-product page was opened
+            // here and then never used or closed — one leaked renderer process
+            // per source product. Pages are now opened and closed per fetch by
+            // helper/browserClient.js.)
             try {
 
                 for (let i = 0; i < productLinks.length; i++) {
@@ -376,24 +365,13 @@ async function productMatching(brands, projectId, category) {
                     // Throttle between product detail requests.
                     await delay(1000);
 
-                    // Retry this single link up to 3 times (escalating to premium
-                    // rendering after the first failure) instead of letting a
-                    // transient proxy error (e.g. 502) abort the entire batch.
+                    // Retry this single link up to 3 times instead of letting a
+                    // transient proxy error abort the entire batch.
                     let productResponse = null;
                     let linkError = null;
                     for (let attempt = 1; attempt <= 3; attempt++) {
                         try {
-                            const premium_level = attempt >= 2 ? "level_2" : "level_1";
-
-                            let config = {
-                                method: 'get',
-                                maxBodyLength: Infinity,
-                                url: `https://proxy.scrapeops.io/v1/?api_key=6aa09d27-c12a-49b1-9332-b0fe571795c2&url=${link}&render_js=true&premium=${premium_level}`,
-                                headers: {}
-                            };
-
-                            const response = await axios.request(config);
-                            productResponse = response.data;
+                            productResponse = await fetchViaBrowser(link);
                             linkError = null;
                             break;
                         } catch (err) {
@@ -632,7 +610,7 @@ async function productMatching(brands, projectId, category) {
         // }
         // }
 
-        await browser.close();
+        await closeBrowser();
 
 
     } catch (err) {
@@ -864,6 +842,18 @@ app.get("/test", async (req, res) => {
     return res.status(200).json({ message: "API is working fine." });
 });
 
-app.listen(8010, () => {
+const server = app.listen(8010, () => {
     console.log("Server is running on port 8010");
 });
+
+// The scraping browser (helper/browserClient.js) is launched lazily on the
+// first fetch and then kept warm for the life of the process, so a Ctrl-C or
+// a container stop would otherwise leave an orphaned Chrome behind.
+for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, async () => {
+        console.log(`Received ${signal}, shutting down...`);
+        server.close();
+        await closeBrowser();
+        process.exit(0);
+    });
+}
