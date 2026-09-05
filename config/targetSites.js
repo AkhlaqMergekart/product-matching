@@ -5,9 +5,13 @@ const xpath = require("xpath");
 // to read an individual product page. Adding a new marketplace means adding
 // an entry here, not touching the matching engine in index.js.
 //
-// `scraper` selects which proxy client fetchHtml() (helper/scrapeClient.js)
-// uses to actually retrieve the page — sites differ in how aggressively they
-// block scrapers, so the fetch method is part of the site's config too.
+// `scraper` names the fetch strategy fetchHtml() (helper/scrapeClient.js)
+// uses to retrieve the page. Every target now uses "puppeteer" — a real
+// headless browser driven through the Webshare rotating proxy
+// (helper/browserClient.js) — having previously gone through the ScrapeOps
+// and ScrapingAnt HTTP proxy APIs. The field is kept because the fetch method
+// is genuinely part of a site's config, so a future target can opt into a
+// different one without touching the matching engine.
 //
 // `needsDetailFetch: true`  -> visit each candidate's own product page for
 //   full field data (title/price/brand/images). Used for sites whose search
@@ -23,7 +27,7 @@ const targetSites = {
   nahdi: {
     id: "nahdi",
     label: "Nahdi",
-    scraper: "scrapeops",
+    scraper: "puppeteer",
     needsDetailFetch: true,
 
     buildSearchUrl: (query) =>
@@ -71,7 +75,7 @@ const targetSites = {
   firstcryAE: {
     id: "firstcryAE",
     label: "Firstcry UAE",
-    scraper: "scrapeops",
+    scraper: "puppeteer",
     needsDetailFetch: true,
 
     // Verified live 2026-07-21: a plain multi-word query returns a real
@@ -170,10 +174,10 @@ const targetSites = {
   amazonAE: {
     id: "amazonAE",
     label: "Amazon UAE",
-    // HLD section 5 specifies ScrapingAnt for this target, but that key
-    // (helper/scrapeClient.js) is currently rejected by the API with
-    // "API token is wrong", so ScrapeOps it is until someone re-issues it.
-    scraper: "scrapeops",
+    // Was ScrapeOps (itself a stand-in for the ScrapingAnt key HLD section 5
+    // specified, which that API rejected as "API token is wrong"). Both are
+    // retired — this target is fetched in-browser like every other one.
+    scraper: "puppeteer",
     scraperOptions: { country: "ae" },
     needsDetailFetch: false,
 
@@ -193,9 +197,10 @@ const targetSites = {
     brandFallback: {
       needed: (candidate) => !candidate.brand || !String(candidate.brand).trim(),
       buildUrl: (candidate) => `https://www.amazon.ae/-/en/dp/${candidate.sku}`,
-      // These fields are server-rendered, so JS rendering is wasted here —
-      // verified 2026-07-26: render_js=false returns the same brand in
-      // ~16s vs ~33s.
+      // These fields are server-rendered, so waiting for the page's JS to
+      // settle is wasted here — renderJs: false returns as soon as the DOM is
+      // parsed. (Under ScrapeOps the equivalent render_js=false was measured
+      // 2026-07-26 at ~16s vs ~33s for the same brand value.)
       scraperOptions: { country: "ae", renderJs: false },
       // Safety valve. If a whole page came back without bylines this would
       // otherwise fetch all 48; better to enrich the first N and leave the
