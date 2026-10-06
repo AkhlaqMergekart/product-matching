@@ -13,21 +13,74 @@ const xpath = require("xpath");
 // is genuinely part of a site's config, so a future target can opt into a
 // different one without touching the matching engine.
 //
-// `needsDetailFetch: true`  -> visit each candidate's own product page for
-//   full field data (title/price/brand/images). Used for sites whose search
-//   results don't carry enough data to compare against (Nahdi, Firstcry UAE).
-// `needsDetailFetch: false` -> build the full candidate object directly from
-//   the search-results page, no second request per candidate. Used for
-//   Amazon UAE, mirroring the approach already proven in
-//   sellerpundit-backend/cluster-service/bulkUpload.js — visiting individual
-//   Amazon product pages at scale carries a much higher block risk than
-//   reading the search-results grid once.
+// There are three ways a target can turn one search into full candidate
+// objects. buildCandidatesFromSearch() in index.js checks them in this order:
+//
+// 1. `detailApi` -> read the SKUs off the search page, then fetch every
+//    candidate's data from the site's own JSON endpoint in one batched request.
+//    One request for the whole candidate set. Used for Nahdi.
+// 2. `needsDetailFetch: false` -> build the full candidate object directly
+//    from the search-results page, no second request at all. Used for Amazon
+//    UAE, whose grid carries enough data to compare against and whose product
+//    pages carry a much higher block risk than reading the grid once.
+// 3. `needsDetailFetch: true` -> visit each candidate's own product page for
+//    full field data. One request per candidate, so it's the most expensive
+//    and most block-prone of the three; only Firstcry UAE still needs it,
+//    having no known JSON endpoint.
+
+// Pulls the schema.org Product node out of a page's <script
+// type="application/ld+json"> blocks. Sites publish these for Google, which
+// means they are maintained, server-rendered, and far more stable than the
+// utility-class selectors a Tailwind/Next.js storefront ships — Nahdi's
+// product page carries five such blocks (Organization, BreadcrumbList,
+// WebSite, ImageObject, Product).
+//
+// Returns null when the page has no Product node, so callers fall back to
+// their own selectors rather than throwing.
+function extractJsonLdProduct(doc) {
+  const scripts = xpath.select("//script[@type='application/ld+json']", doc);
+
+  for (const script of scripts) {
+    let parsed;
+    try {
+      parsed = JSON.parse(script.textContent);
+    } catch (err) {
+      continue; // A malformed block is not a reason to abandon the others.
+    }
+
+    // A block can be a single node, an array of them, or a @graph wrapper.
+    const nodes = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed?.["@graph"])
+        ? parsed["@graph"]
+        : [parsed];
+
+    const product = nodes.find((node) => {
+      const type = node?.["@type"];
+      return Array.isArray(type) ? type.includes("Product") : type === "Product";
+    });
+
+    if (product) return product;
+  }
+
+  return null;
+}
 
 const targetSites = {
   nahdi: {
     id: "nahdi",
     label: "Nahdi",
-    scraper: "puppeteer",
+    // Plain GETs through the sticky proxy — no browser. Verified live
+    // 2026-10-06: both the search page and the product pages answer HTTP 200
+    // with a real browser's headers and no cookies at all (no Cloudflare
+    // clearance needed), in ~1-5s against ~13-30s for a Chrome navigation, and
+    // the extractors below find the same data in the result.
+    scraper: "axios",
+    // Back to a page per candidate, which is affordable now that a page is a
+    // ~1-2s GET on a held-open proxy tunnel rather than a ~13s browser
+    // navigation on a fresh IP. The page carries what the JSON endpoint cannot
+    // (all 11 gallery images, the real description), and `detailApi` below
+    // stays on as a bulk fallback.
     needsDetailFetch: true,
 
     buildSearchUrl: (query) =>
@@ -39,36 +92,144 @@ const targetSites = {
         .map((itm) => "https://www.nahdionline.com" + itm.getAttribute("href")),
 
     extractDetail: (doc, link) => {
-      const category = xpath
+      // Everything structured comes from the page's schema.org Product block
+      // rather than from CSS classes. That is deliberate: the class-based
+      // selectors this replaced were both fragile and, in two cases, wrong.
+      //
+      //   price: the old selector read the right <div>, but Nahdi renders the
+      //     SAR symbol as an inline <svg> whose <style> text lands inside it,
+      //     so textContent was ".sar_symbol_svg__cls-1{fill:#231f20}254.00" and
+      //     parseFloat() returned NaN — which then fell through to the MRP.
+      //     That is how SKU 103804790 was recorded at 878.60 for a product that
+      //     sells for 254.00.
+      //   images: the old gallery selector matches nothing on the served HTML
+      //     (0 hits); the carousel is built client-side. The JSON-LD carries
+      //     all 11 image URLs.
+      //
+      // offers is an AggregateOffer: lowPrice is what the shopper pays,
+      // highPrice is the pre-discount list price. Verified against the
+      // storefront API for 103804790 — 254 / 878.6, matching exactly.
+      const product = extractJsonLdProduct(doc);
+      const offers = product?.offers || {};
+
+      // The description is NOT in the JSON-LD (it repeats the product name
+      // there), so this one field still comes from the page body.
+      const description = xpath.select("//div[@class='pdp-about-section']", doc)?.[0]?.textContent;
+
+      // Breadcrumb fallback for category. Nahdi emits an empty <li> between
+      // "Home" and the first real level, and ends with the product name, so
+      // trim both ends rather than passing "Home >  > ... > <product>" to the
+      // matching service.
+      const crumbs = xpath
         .select("//ul[@class='flex items-center text-custom-xs font-semibold text-gray ']/li", doc)
-        ?.map((itm) => itm.textContent)
-        .join(" > ");
-      const brand = xpath.select("//div[@class='flex items-center space-x-2 empty:hidden rtl:space-x-reverse']", doc)?.[0]?.textContent;
-      const title = xpath.select("//h1", doc)?.[0]?.textContent;
-      const price = xpath.select("//div[@class='flex items-center text-primary-red']", doc)?.[0]?.textContent;
-      const mrp = xpath.select("//div[@class='items-center mx-2 flex text-lg text-gray-500 line-through']", doc)?.[0]?.textContent;
-      const express = xpath.select("//div[@class='ms-1 flex min-w-fit flex-row']/img", doc).length > 0;
-      const description = xpath.select("//div[@class='pdp-about-section']", doc);
-      const totalRating = xpath.select("//span[@class='flex items-center gap-2 text-2xl font-semibold']", doc)?.[0]?.textContent;
-      const totalReview = xpath.select("//span[@class='hidden text-xl lg:block']", doc)?.[0]?.textContent;
-      const images = xpath
-        .select("//img[@class='relative h-full w-full object-contain transition duration-300 ease-in-out group-hover:scale-105']", doc)
-        .map((itm) => itm.getAttribute("src"));
+        .map((itm) => itm.textContent.trim())
+        .filter(Boolean)
+        .filter((part) => part.toLowerCase() !== "home")
+        .slice(0, -1);
+
+      const sku = String(product?.sku || link.split("/").pop().split("?")[0] || "");
+
+      const price = parseFloat(offers.lowPrice ?? offers.price) || 0;
+      const mrp = parseFloat(offers.highPrice ?? offers.lowPrice ?? offers.price) || 0;
 
       return {
         url: link,
-        category: category || "",
-        brand: brand || "",
-        title: title || "",
-        sku: link.split("/").pop().split("?")[0] || "",
-        price: parseFloat(price) || parseFloat(mrp) || 0,
-        mrp: parseFloat(mrp) || 0,
-        totalRating: totalRating || "",
-        totalReview: totalReview || "",
-        express: express || false,
-        description: description[0]?.textContent || "",
-        images: images || [],
+        category: product?.category || crumbs.join(" > ") || "",
+        brand: product?.brand?.name || product?.brand || "",
+        title: product?.name || xpath.select("//h1", doc)?.[0]?.textContent?.trim() || "",
+        sku,
+        price,
+        mrp: mrp || price,
+        totalRating: product?.aggregateRating?.ratingValue ? String(product.aggregateRating.ratingValue) : "",
+        totalReview: product?.aggregateRating?.reviewCount ? String(product.aggregateRating.reviewCount) : "",
+        express: false,
+        description: description?.trim() || "",
+        images: Array.isArray(product?.image) ? product.image : product?.image ? [product.image] : [],
       };
+    },
+
+    // Bulk fallback, used by buildCandidatesFromSearch() only when the
+    // per-candidate pages above yield nothing at all. One request for the whole
+    // candidate set — measured 2026-10-03: 20 SKUs in 16 KB, 0.33s direct /
+    // ~3.0s proxied. It carries the right price and category but only the main
+    // catalogue image, so it is the degraded path, not the preferred one.
+    detailApi: {
+      // SKU is the last path segment of a product link
+      // (/en-sa/<slug>/pdp/<sku>), which is exactly what the endpoint keys on.
+      extractListingSkus: (doc) =>
+        xpath
+          .select("//a[@class='flex h-full flex-col']", doc)
+          .map((itm) => (itm.getAttribute("href") || "").split("?")[0].split("/").filter(Boolean).pop())
+          .filter(Boolean),
+
+      // 20 (one full search page) is verified; the cap is here so an unusually
+      // long result set is split rather than sent as one enormous query string.
+      batchSize: 50,
+
+      buildUrl: (skus) =>
+        `https://www.nahdionline.com/api/analytics/product?skus=${skus.join(",")}&language=en&region=SA`,
+
+      mapItem: (item) => {
+        // item_category/2/3/... is the shopper-facing taxonomy but comes back
+        // empty for plenty of SKUs (every Anivagene/Balmy/Avene item in the
+        // 2026-10-03 sample). The imf_* fields carry the internal taxonomy and
+        // were populated on all of them, so fall back to those rather than
+        // handing the matching service a blank category.
+        const retailCategory = [
+          item.item_category,
+          item.item_category2,
+          item.item_category3,
+          item.item_category4,
+          item.item_category5,
+        ]
+          .filter((part) => part && String(part).trim())
+          .join(" > ");
+
+        const internalCategory = [
+          item.imf_division,
+          item.imf_department,
+          item.imf_category,
+          item.imf_sub_category,
+          item.imf_class,
+        ]
+          .filter((part) => part && String(part).trim())
+          .join(" > ");
+
+        // item_link has no locale prefix ("/teknum-flylite-stroller-black/pdp/
+        // 103804790"), so prepend the one the rest of this file uses — those
+        // are the URLs that land in the exported sheet.
+        const link = item.item_link
+          ? `https://www.nahdionline.com/en-sa${item.item_link}`
+          : item.item_id
+            ? `https://www.nahdionline.com/en-sa/pdp/${item.item_id}`
+            : "";
+
+        return {
+          url: link,
+          category: retailCategory || internalCategory || "",
+          brand: item.item_brand || "",
+          title: item.item_name || "",
+          sku: String(item.item_id || ""),
+          // price is what the shopper pays, shelf_price is the pre-discount
+          // list price. The old detail-page scrape read the struck-through
+          // figure into `price` and left `mrp` at 0 — for SKU 103804790 that
+          // meant price 878.6 when the product actually sells for 254.
+          price: parseFloat(item.price) || parseFloat(item.shelf_price) || 0,
+          mrp: parseFloat(item.shelf_price) || parseFloat(item.price) || 0,
+          // Not carried by this endpoint. They were never match gates — the
+          // four gates are title, brand, color and image_similarity — so
+          // nothing in the scoring regresses by leaving them empty.
+          totalRating: "",
+          totalReview: "",
+          express: false,
+          description: "",
+          // One image (the main catalogue shot) where the product page offered
+          // ~11. This is the real trade-off of the API route: image_similarity
+          // IS one of the four gates. The main shot is the one that carries the
+          // comparison, and a blocked run returns no images at all.
+          images: item.item_image_link ? [item.item_image_link] : [],
+        };
+      },
     },
   },
 

@@ -1,13 +1,12 @@
 const axios = require("axios");
 const fs = require("fs");
 const cheerio = require("cheerio");
-const xpath = require("xpath");
 const dom = require("xmldom").DOMParser;
 const express = require("express");
 const app = express();
 const sendUpdateReportEmail = require("./helper/sendUpdateReport.js");
-const { fetchHtml } = require("./helper/scrapeClient.js");
-const { fetchViaBrowser, closeBrowser } = require("./helper/browserClient.js");
+const { fetchHtml, closeFetchClients } = require("./helper/scrapeClient.js");
+const { fetchPage, fetchJson } = require("./helper/httpClient.js");
 const { exportResultsToExcel } = require("./helper/exportResults.js");
 const targetSites = require("./config/targetSites.js");
 const brandTargets = require("./config/brandTargets.js");
@@ -111,10 +110,65 @@ async function enrichMissingBrands(targetConfig, candidates) {
     return candidates;
 }
 
+// Turns a search-results page into candidates via the target's own JSON
+// endpoint (targetConfig.detailApi), rather than one product-page fetch per
+// candidate. Driven entirely by config, so a second site with a usable
+// endpoint needs no changes here.
+async function buildCandidatesFromApi(targetConfig, doc, query) {
+    const cfg = targetConfig.detailApi;
+
+    const skus = cfg.extractListingSkus(doc);
+    if (skus.length === 0) {
+        console.log(`No products found on ${targetConfig.label} for:`, query);
+        return [];
+    }
+
+    // De-dupe before asking: a search page can link the same SKU more than
+    // once, and the endpoint would just return it twice.
+    const uniqueSkus = [...new Set(skus)];
+    const batchSize = cfg.batchSize || uniqueSkus.length;
+    const candidates = [];
+
+    for (let i = 0; i < uniqueSkus.length; i += batchSize) {
+        const batch = uniqueSkus.slice(i, i + batchSize);
+
+        if (i > 0) {
+            await delay(1000);
+        }
+
+        let items;
+        try {
+            items = await fetchJson(cfg.buildUrl(batch));
+        } catch (err) {
+            // Lose this batch, keep the rest — same posture as a failed detail
+            // page in the per-candidate path below.
+            console.error(`Error fetching ${targetConfig.label} product API for ${batch.length} SKU(s):`, err.message);
+            continue;
+        }
+
+        if (!Array.isArray(items)) {
+            console.error(`Unexpected ${targetConfig.label} product API response (expected an array):`, typeof items);
+            continue;
+        }
+
+        for (const item of items) {
+            try {
+                candidates.push(cfg.mapItem(item));
+            } catch (err) {
+                console.error(`Error mapping ${targetConfig.label} API item:`, err.message);
+            }
+        }
+    }
+
+    console.log(`  ${targetConfig.label}: ${uniqueSkus.length} SKU(s) on the search page -> ${candidates.length} candidate(s) from the product API`);
+
+    return candidates;
+}
+
 // Searches `targetConfig`'s site for `query` and returns a full list of
 // candidate product objects, ready to hand to the matching service. This is
 // the piece that used to be hardcoded to Nahdi — every site-specific fact
-// (search URL, listing/detail selectors, which proxy client to use) comes
+// (search URL, listing/detail selectors, which fetch strategy to use) comes
 // from targetConfig (config/targetSites.js) instead.
 async function buildCandidatesFromSearch(targetConfig, query) {
     const searchUrl = targetConfig.buildSearchUrl(query);
@@ -130,13 +184,47 @@ async function buildCandidatesFromSearch(targetConfig, query) {
     const $ = cheerio.load(searchHtml);
     const doc = new dom().parseFromString($.xml(), "text/xml");
 
-    // Some targets (Amazon UAE) carry enough data on the search-results page
-    // itself, so there's no per-candidate detail fetch at all.
-    if (!targetConfig.needsDetailFetch) {
-        const candidates = targetConfig.extractListingProducts(doc);
-        return enrichMissingBrands(targetConfig, candidates);
+    return buildCandidatesFromDoc(targetConfig, doc, query);
+}
+
+// Turns an already-fetched search-results document into candidates, picking one
+// of three modes from the target's config. Split out from
+// buildCandidatesFromSearch so the legacy flow — which fetches its own search
+// page — goes through exactly the same logic instead of its own copy.
+async function buildCandidatesFromDoc(targetConfig, doc, query) {
+    // Mode A: a page per candidate (Nahdi, Firstcry UAE). The richest data —
+    // full image gallery, description, real price — and affordable again now
+    // that a page is a ~1-2s GET on a held-open proxy tunnel rather than a
+    // ~13s browser navigation.
+    if (targetConfig.needsDetailFetch) {
+        const candidates = await buildCandidatesFromDetailPages(targetConfig, doc, query);
+
+        // If every page failed, fall back to the site's bulk endpoint where one
+        // is configured. Degraded (Nahdi's carries only the main image) but far
+        // better than returning nothing for this source product.
+        if (candidates.length === 0 && targetConfig.detailApi) {
+            console.log(`  ${targetConfig.label}: no candidates from product pages, falling back to the bulk product API`);
+            return buildCandidatesFromApi(targetConfig, doc, query);
+        }
+
+        return candidates;
     }
 
+    // Mode B: the site has its own JSON endpoint and no detail-page pass. Read
+    // the SKUs off the search page and fetch every candidate in one request.
+    if (targetConfig.detailApi) {
+        return buildCandidatesFromApi(targetConfig, doc, query);
+    }
+
+    // Mode C: some targets (Amazon UAE) carry enough data on the search-results
+    // page itself, so there's no second request at all.
+    const candidates = targetConfig.extractListingProducts(doc);
+    return enrichMissingBrands(targetConfig, candidates);
+}
+
+// Mode A: one product page per candidate. A failed or unparseable page costs
+// only its own candidate.
+async function buildCandidatesFromDetailPages(targetConfig, doc, query) {
     const productLinks = targetConfig.extractListingLinks(doc);
     if (productLinks.length === 0) {
         console.log(`No products found on ${targetConfig.label} for:`, query);
@@ -147,7 +235,9 @@ async function buildCandidatesFromSearch(targetConfig, query) {
     for (let i = 0; i < productLinks.length; i++) {
         const link = productLinks[i];
 
-        // Throttle between product detail requests.
+        // Throttle between product detail requests. Kept even on the cheap
+        // fetch path — the point is to look like a person reading a catalogue,
+        // and the sticky exit IP is only worth holding if we don't hammer it.
         await delay(1000);
 
         let detailHtml = null;
@@ -167,6 +257,8 @@ async function buildCandidatesFromSearch(targetConfig, query) {
             console.error(`Error parsing ${targetConfig.label} product page:`, link, err.message);
         }
     }
+
+    console.log(`  ${targetConfig.label}: ${productLinks.length} product page(s) -> ${candidates.length} candidate(s)`);
 
     return candidates;
 }
@@ -241,10 +333,11 @@ function pickBestMatch(matchData) {
 
 // ---------------------------------------------------------------------------
 // Legacy Mumzworld -> Nahdi flow (original, unrefactored implementation).
-// Pulls source rows by SKU list + projectId, searches Nahdi in a headless
-// browser via the Webshare proxy, scrapes each product page with
-// cheerio/xpath, and matches against the matching microservice. Existing callers of POST
-// /product-matching keep working exactly as before.
+// Pulls source rows by SKU list + projectId, loads the Nahdi search page in a
+// headless browser via the Webshare proxy, reads every candidate from Nahdi's
+// own product API in one batched call, and matches against the matching
+// microservice. Existing callers of POST /product-matching keep working
+// exactly as before.
 // ---------------------------------------------------------------------------
 async function productMatching(brands, projectId, category) {
     try {
@@ -314,7 +407,7 @@ async function productMatching(brands, projectId, category) {
                 // premium tier on retryCount >= 2. There's no tier to
                 // escalate now; a retry gets a fresh browser context and
                 // therefore a fresh rotating exit IP instead.
-                htmlResponse = await fetchViaBrowser(url);
+                htmlResponse = await fetchPage(url);
             } catch (err) {
                 console.error("Error navigating to URL:", err);
                 retryCount++;
@@ -336,101 +429,25 @@ async function productMatching(brands, projectId, category) {
 
             const doc = new dom().parseFromString($.xml(), 'text/xml');
 
-            let productLinks = xpath.select("//a[@class='flex h-full flex-col']", doc).map(itm => "https://www.nahdionline.com" + itm.getAttribute("href"));
-
-            if (productLinks.length === 0) {
-                console.log("No products found for:", sourceProduct.title);
-
-                await appendToFile(errorFilePath, {
-                    sourceProduct: sourceProduct,
-                    error: "No products found"
-                });
-
-                continue; // Skip to the next source product if no products found
-            }
-
-            console.log("Found products:", productLinks.length);
-
-            const productBatches = [];
-            // Process each product link. (A per-source-product page was opened
-            // here and then never used or closed — one leaked renderer process
-            // per source product. Pages are now opened and closed per fetch by
-            // helper/browserClient.js.)
+            // Shares the brand flow's dispatch (config/targetSites.js decides
+            // the mode), so the two flows can't drift apart on how a Nahdi
+            // product is read and the listing selector exists in exactly one
+            // place. It does its own link extraction and its own empty check,
+            // which is why the extraction that used to sit here is gone — the
+            // productBatches.length check below covers the empty case.
+            //
+            // This is where the win is for a blocked run: the ~20 full Chrome
+            // navigations per source product are now ~20 plain GETs sharing one
+            // held-open proxy tunnel.
+            let productBatches = [];
             try {
-
-                for (let i = 0; i < productLinks.length; i++) {
-                    const link = productLinks[i];
-                    console.log("Processing link:", link);
-
-                    // Throttle between product detail requests.
-                    await delay(1000);
-
-                    // Retry this single link up to 3 times instead of letting a
-                    // transient proxy error abort the entire batch.
-                    let productResponse = null;
-                    let linkError = null;
-                    for (let attempt = 1; attempt <= 3; attempt++) {
-                        try {
-                            productResponse = await fetchViaBrowser(link);
-                            linkError = null;
-                            break;
-                        } catch (err) {
-                            linkError = err;
-                            console.error(`Error fetching product link (attempt ${attempt}/3):`, link, err.message);
-                            if (attempt < 3) {
-                                await delay(1000);
-                            }
-                        }
-                    }
-
-                    if (linkError) {
-                        console.error("Max retries reached for product link:", link);
-                        await appendToFile(errorFilePath, {
-                            sourceProduct: sourceProduct,
-                            link: link,
-                            error: linkError.message
-                        });
-                        continue; // Skip this link, keep processing the rest of the batch
-                    }
-
-                    const $ = cheerio.load(productResponse);
-
-                    const doc = new dom().parseFromString($.xml(), "text/xml");
-
-                    const category = xpath.select("//ul[@class='flex items-center text-custom-xs font-semibold text-gray ']/li", doc)?.map(itm => itm.textContent).join(" > ");
-                    const brand = xpath.select("//div[@class='flex items-center space-x-2 empty:hidden rtl:space-x-reverse']", doc)?.[0]?.textContent;
-                    const title = xpath.select("//h1", doc)?.[0]?.textContent;
-                    const price = xpath.select("//div[@class='flex items-center text-primary-red']", doc)?.[0]?.textContent;
-                    const mrp = xpath.select("//div[@class='items-center mx-2 flex text-lg text-gray-500 line-through']", doc)?.[0]?.textContent
-                    const express = xpath.select("//div[@class='ms-1 flex min-w-fit flex-row']/img", doc).length > 0 ? true : false;
-                    const description = xpath.select("//div[@class='pdp-about-section']", doc);
-                    const totalRating = xpath.select("//span[@class='flex items-center gap-2 text-2xl font-semibold']", doc)?.[0]?.textContent;
-                    const totalReview = xpath.select("//span[@class='hidden text-xl lg:block']", doc)?.[0]?.textContent;
-                    // console.log(xpath.select("//img[@class='relative h-full w-full object-contain transition duration-300 ease-in-out group-hover:scale-105']", doc).length)
-                    const images = xpath.select("//img[@class='relative h-full w-full object-contain transition duration-300 ease-in-out group-hover:scale-105']", doc).map(itm => itm.getAttribute("src"))
-                    // console.log(description.length)
-                    console.log(images)
-                    const product = {
-                        url: link,
-                        category: category || "",
-                        brand: brand || "",
-                        title: title || "",
-                        sku: link.split("/").pop().split("?")[0] || "",
-                        price: parseFloat(price) || parseFloat(mrp) || 0,
-                        mrp: parseFloat(mrp) || 0,
-                        totalRating: totalRating || "",
-                        totalReview: totalReview || "",
-                        express: express || false,
-                        description: description[0]?.textContent || "",
-                        images: images || []
-                    };
-
-                    productBatches.push(product);
-
-                }
-
+                productBatches = await buildCandidatesFromDoc(
+                    targetSites.nahdi,
+                    doc,
+                    sourceProduct.title
+                );
             } catch (error) {
-                console.error("Error processing product links:", error);
+                console.error("Error building Nahdi candidates:", error);
 
                 await appendToFile(errorFilePath, {
                     sourceProduct: sourceProduct,
@@ -610,7 +627,7 @@ async function productMatching(brands, projectId, category) {
         // }
         // }
 
-        await closeBrowser();
+        await closeFetchClients();
 
 
     } catch (err) {
@@ -846,14 +863,15 @@ const server = app.listen(8010, () => {
     console.log("Server is running on port 8010");
 });
 
-// The scraping browser (helper/browserClient.js) is launched lazily on the
-// first fetch and then kept warm for the life of the process, so a Ctrl-C or
-// a container stop would otherwise leave an orphaned Chrome behind.
+// Both fetch clients hold something open for the life of the process — the
+// browser (helper/browserClient.js) and the keep-alive proxy tunnel
+// (helper/httpClient.js) — so a Ctrl-C or a container stop would otherwise
+// leave an orphaned Chrome and a dangling socket behind.
 for (const signal of ["SIGINT", "SIGTERM"]) {
     process.on(signal, async () => {
         console.log(`Received ${signal}, shutting down...`);
         server.close();
-        await closeBrowser();
+        await closeFetchClients();
         process.exit(0);
     });
 }
