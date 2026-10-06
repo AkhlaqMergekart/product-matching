@@ -1,29 +1,40 @@
 const { fetchViaBrowser, closeBrowser } = require("./browserClient.js");
+const { fetchPage, closeSession } = require("./httpClient.js");
 
-// Fetches `url` with a real browser (helper/browserClient.js) through the
-// Webshare rotating proxy, retrying up to 3 times.
+// Fetches `url` with whichever strategy `scraperType` names, retrying up to 3
+// times. Both strategies route every request through the Webshare proxy, so
+// nothing here ever leaves from the host's own IP.
 //
-// This used to dispatch to one of two HTTP proxy APIs (ScrapeOps /
-// ScrapingAnt). Both are gone: every target is now scraped in-browser, which
-// removes the per-request credit cost and the dependency on a third party's
-// rendering tier. `scraperType` is kept in the signature — and the old names
-// still accepted — so config/targetSites.js entries and any callers that
-// still pass "scrapeops" keep working.
+//   "axios"     -> helper/httpClient.js. A plain GET with a real browser's
+//                  headers over a sticky, keep-alive proxy tunnel. ~1-5s a
+//                  page. Preferred: it is an order of magnitude cheaper than a
+//                  browser, and it holds one exit IP for as long as that IP
+//                  keeps working rather than burning a new one per request.
+//   "puppeteer" -> helper/browserClient.js. Real headless Chrome. Needed only
+//                  where a page's data is injected by its own JavaScript, or
+//                  where the site will not serve a non-browser client.
 //
-// A retry is meaningful here even though nothing escalates a "premium tier"
-// any more: each attempt opens a fresh browser context, which takes a new
-// connection through the rotating endpoint and so a new exit IP. Attempt 2 is
-// genuinely not the same request from the same address.
-//
+// This used to dispatch to two paid HTTP proxy APIs (ScrapeOps / ScrapingAnt).
+// Both are gone; their names are still accepted and map to the browser so an
+// old config keeps working.
+const BROWSER_SCRAPERS = new Set(["puppeteer", "browser", "scrapeops", "scrapingant"]);
+const HTTP_SCRAPERS = new Set(["axios", "http"]);
+
 // `options` comes from the target's `scraperOptions` in config/targetSites.js
 // and carries per-site fetch concerns that aren't the caller's business:
-//   renderJs -> false skips waiting for network idle on server-rendered pages
 //   headers  -> forwarded to the target site (locale, etc.)
-//   country  -> accepted but no longer enforced (see browserClient.js)
-const SUPPORTED_SCRAPERS = new Set(["puppeteer", "browser", "scrapeops", "scrapingant"]);
-
+//   renderJs -> browser only; false skips waiting for network idle
+//   country  -> accepted but not enforced (see browserClient.js)
 async function fetchHtml(scraperType, url, options = {}) {
-  if (scraperType && !SUPPORTED_SCRAPERS.has(scraperType)) {
+  const type = scraperType || "axios";
+
+  if (HTTP_SCRAPERS.has(type)) {
+    // httpClient runs its own attempt loop, rotating the exit IP between
+    // tries, so there is nothing to wrap here.
+    return fetchPage(url, options);
+  }
+
+  if (!BROWSER_SCRAPERS.has(type)) {
     throw new Error(`Unknown scraper type: ${scraperType}`);
   }
 
@@ -43,4 +54,11 @@ async function fetchHtml(scraperType, url, options = {}) {
   throw lastError;
 }
 
-module.exports = { fetchHtml, closeBrowser };
+// Releases both fetch paths' long-lived resources (the browser and the proxy
+// tunnel).
+async function closeFetchClients() {
+  closeSession();
+  await closeBrowser();
+}
+
+module.exports = { fetchHtml, closeFetchClients, closeBrowser };

@@ -1,19 +1,11 @@
 const puppeteer = require("puppeteer");
+const { PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD } = require("../config/proxy.js");
+const { isBlockPage } = require("./blockDetect.js");
 
-// Webshare rotating endpoint. It hands out a different exit IP per new
-// connection, which is what replaces ScrapeOps' "escalate to premium after a
-// failed attempt" behaviour — see fetchViaBrowser() for how each fetch is
-// made to take a new connection.
-//
-// Overridable by env so the credentials don't have to be edited in code when
-// they're rotated (defaults match the current Webshare account, mirroring how
-// the ScrapeOps/ScrapingAnt keys used to be carried in this repo).
-const PROXY_HOST = process.env.PROXY_HOST || "p.webshare.io";
-const PROXY_PORT = process.env.PROXY_PORT || "80";
-const PROXY_USERNAME = process.env.PROXY_USERNAME || "mergekart2026-rotate";
-const PROXY_PASSWORD = process.env.PROXY_PASSWORD || "t2E4zKv9egS7LFAC";
-
-const PROXY_SERVER = `http://${PROXY_HOST}:${PROXY_PORT}`;
+// The Webshare rotating endpoint (config/proxy.js) hands out a different exit
+// IP per new connection, which is what replaces ScrapeOps' "escalate to
+// premium after a failed attempt" behaviour — see fetchViaBrowser() for how
+// each fetch is made to take a new connection.
 
 // Headless Chrome's own UA string contains "HeadlessChrome", which is one of
 // the cheapest bot signals there is. Present as ordinary desktop Chrome.
@@ -28,53 +20,6 @@ const NAVIGATION_TIMEOUT_MS = 90000;
 // substantially. Stylesheets are deliberately NOT blocked: some sites gate
 // content rendering on their CSS having loaded.
 const BLOCKED_RESOURCE_TYPES = new Set(["image", "media", "font"]);
-
-// Anti-bot interstitials are served with HTTP 200, so a status check alone
-// waves them through and the extractors then report "no products found" (or,
-// worse, a silently blank field — an Amazon captcha page is what made the
-// brandFallback top-up return "" instead of "TEKNUM"). Detecting them here
-// turns a block into a thrown error, which is what lets fetchHtml()'s retry
-// loop rotate onto a different exit IP and try again.
-//
-// Both halves of the test have to hold. The phrases are specific enough on
-// their own, but the size gate is cheap insurance against a real product page
-// that happens to mention one of them in a review or a description — measured
-// live 2026-09-05, amazon.ae's block pages are ~2-4 KB while its genuine
-// product and search pages are 660 KB - 1.5 MB.
-const BLOCK_PAGE_MARKERS = [
-  /Enter the characters you see below/i,
-  /errors[/]validateCaptcha/i,
-  /Type the characters you see in this image/i,
-  /we just need to make sure you'?re not a robot/i,
-  /To discuss automated access to Amazon data/i,
-  /Robot Check/i,
-  /Access Denied/i,
-  /Request unsuccessful[.] Incapsula/i,
-  /Checking your browser before accessing/i,
-  /Attention Required!/i,
-  /Cloudflare Ray ID/i,
-];
-
-const BLOCK_PAGE_MAX_BYTES = 50000;
-
-// Backstop for block pages whose wording isn't in the list above. Every real
-// page any target here serves is enormous — the smallest genuine response
-// measured live 2026-09-05 was a 667 KB Amazon product page, against search
-// pages of 1.2-3.3 MB — while the interstitials are 2-4 KB. A response this
-// small is never something the extractors can read, so the useful outcome is
-// a throw (which retries onto another exit IP), not a silent "0 products".
-//
-// This caught a real gap: a 1993-byte amazon.ae response carried none of the
-// markers above and came back through fetchHtml as a valid page, yielding 0
-// candidates with no error anywhere in the logs.
-const MIN_PLAUSIBLE_PAGE_BYTES = 8000;
-
-function isBlockPage(html) {
-  if (!html) return true;
-  if (html.length < MIN_PLAUSIBLE_PAGE_BYTES) return true;
-  if (html.length > BLOCK_PAGE_MAX_BYTES) return false;
-  return BLOCK_PAGE_MARKERS.some((marker) => marker.test(html));
-}
 
 let browserPromise = null;
 
