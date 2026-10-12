@@ -297,7 +297,7 @@ async function buildCandidatesFromDetailPages(targetConfig, doc, query) {
 }
 
 // Fields the matching service validates as strings. One non-string value in
-// any of them gets the WHOLE batch rejected with a 422 — seen with Nahdi's
+// any of them gets the WHOLE request rejected with a 422 — seen with Nahdi's
 // JSON-LD `brand: {"@type":"Brand","name":null}` — so they're coerced here
 // whatever a site extractor produced.
 const MATCH_TEXT_FIELDS = ["title", "brand", "category", "description", "sku", "url"];
@@ -327,115 +327,61 @@ function withStringTextFields(product) {
 // Rewraps an axios failure so its message carries the service's own reason —
 // FastAPI's 422 `detail` says which field of which candidate it rejected,
 // which "Request failed with status code 422" does not. That message is what
-// lands in the errors file and the timing log. The batch's SKUs are included
-// because `detail` locates a candidate only by its index in the batch.
-function matchingServiceError(err, batch) {
+// lands in the errors file and the timing log. The candidates' SKUs are
+// included, in request order, because `detail` locates a candidate only by
+// its index in comparable_products.
+function matchingServiceError(err, candidates) {
     if (!err.response) return err;
 
     const body = typeof err.response.data === "string" ? err.response.data : JSON.stringify(err.response.data);
     const reason = body && body.length > 1000 ? `${body.slice(0, 1000)}…` : body;
-    const skus = batch.map((p) => p.sku).join(", ");
+    const skus = candidates.map((p) => p.sku).join(", ");
 
-    const wrapped = new Error(`Matching service returned HTTP ${err.response.status}: ${reason} (batch SKUs: ${skus})`);
+    const wrapped = new Error(`Matching service returned HTTP ${err.response.status}: ${reason} (candidate SKUs in order: ${skus})`);
     wrapped.status = err.response.status;
     wrapped.responseData = err.response.data;
     return wrapped;
 }
 
-// Sends originalProduct + candidates to the matching microservice in
-// batches of 5 (unchanged from the original Nahdi flow) and returns the
-// flattened field-score results. Image similarity is the expensive part of a
-// call, so it's opt-in — see scoreAndShortlist().
-async function callMatchingService(originalProduct, comparableProducts, { includeImageSimilarity = true } = {}) {
+// Sends originalProduct + every candidate to the matching microservice in ONE
+// request, image similarity included, and returns its field-score results.
+// This used to go in batches of 5, but the service's cost is almost all in
+// the first call for a product (~2.5s; each later call ~0.06s, per the
+// Beesline project 349 timing logs of 2026-10-12), so the extra round trips
+// bought nothing.
+async function callMatchingService(originalProduct, comparableProducts) {
     originalProduct.price = originalProduct.price ? parseFloat(originalProduct.price) : 0;
     originalProduct.mrp = originalProduct.mrp ? parseFloat(originalProduct.mrp) : 0;
 
-    let matchData = [];
-    const batchSize = 5;
-    const batchCount = Math.ceil(comparableProducts.length / batchSize);
-    const passLabel = includeImageSimilarity ? "Image matching" : "Text matching";
+    const config = {
+        method: 'post',
+        maxBodyLength: Infinity,
+        url: MATCHING_SERVICE_URL,
+        headers: {
+            'accept': '*/*',
+            'accept-language': 'en-US,en;q=0.9',
+            'content-type': 'application/json',
+            'origin': 'https://www.mumzworld.com',
+            'referer': 'https://www.mumzworld.com/',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
+            'X-API-Key': "test123#"
+        },
+        data: {
+            "original_product": withStringTextFields(originalProduct),
+            "comparable_products": comparableProducts.map(withStringTextFields),
+            "include_image_similarity": true
+        },
+        timeout: 120000
+    };
 
-    for (let i = 0; i < comparableProducts.length; i += batchSize) {
-        const batch = comparableProducts.slice(i, i + batchSize);
-
-        const config = {
-            method: 'post',
-            maxBodyLength: Infinity,
-            url: MATCHING_SERVICE_URL,
-            headers: {
-                'accept': '*/*',
-                'accept-language': 'en-US,en;q=0.9',
-                'content-type': 'application/json',
-                'origin': 'https://www.mumzworld.com',
-                'referer': 'https://www.mumzworld.com/',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
-                'X-API-Key': "test123#"
-            },
-            data: {
-                "original_product": withStringTextFields(originalProduct),
-                "comparable_products": batch.map(withStringTextFields),
-                "include_image_similarity": includeImageSimilarity
-            },
-            timeout: 120000
-        };
-
-        const matchResponse = await timing.step(
-            `${passLabel} batch ${i / batchSize + 1}/${batchCount}`,
-            () => axios.request(config).catch((err) => { throw matchingServiceError(err, batch); }),
-            { detail: `${batch.length} candidate(s)` }
-        );
-        matchData = matchData.concat(matchResponse.data);
-    }
-
-    return matchData;
-}
-
-// Text scores a candidate must beat (strictly) to be worth an image check.
-// Deliberately looser than MATCH_THRESHOLD: this only decides who gets the
-// expensive image pass, and the final 0.85 gate still applies afterwards.
-const PREFILTER_MIN_TITLE = 0.5;
-const PREFILTER_MIN_BRAND = 0.75;
-
-function passesTextPrefilter(scored) {
-    const s = scored.field_scores;
-    return Boolean(s) && s.title > PREFILTER_MIN_TITLE && s.brand > PREFILTER_MIN_BRAND;
-}
-
-// Pass 1 of two-pass matching: every candidate is scored WITHOUT image
-// similarity (cheap), and only those with title > 0.5 and brand > 0.75 make
-// the `shortlist` for pass 2 — callMatchingService() WITH image similarity,
-// whose results are what the result files hold. `textScores` (every
-// candidate, each tagged with shortlistedForImageCheck) goes to a file of its
-// own and never into the result files.
-async function scoreAndShortlist(originalProduct, candidates) {
-    const textScores = await callMatchingService(originalProduct, candidates, { includeImageSimilarity: false });
-
-    // The service sorts each batch by composite score, so its results can't be
-    // mapped back to `candidates` by index. Match on URL (then SKU) to resend
-    // the candidate exactly as it was first sent, falling back to the
-    // service's own echo of it.
-    const shortlist = [];
-    for (const scored of textScores) {
-        scored.shortlistedForImageCheck = passesTextPrefilter(scored);
-        if (!scored.shortlistedForImageCheck) continue;
-
-        const echoed = scored.product || {};
-        const original =
-            candidates.find((c) => echoed.url && c.url === echoed.url) ||
-            candidates.find((c) => echoed.sku && c.sku === echoed.sku) ||
-            echoed;
-        shortlist.push(original);
-    }
-
-    timing.logEvent(
-        `Text pre-filter: ${shortlist.length}/${candidates.length} candidate(s) shortlisted for image check ` +
-        `(title > ${PREFILTER_MIN_TITLE}, brand > ${PREFILTER_MIN_BRAND})`
+    const matchResponse = await timing.step(
+        "Product matching",
+        () => axios.request(config).catch((err) => { throw matchingServiceError(err, comparableProducts); }),
+        { detail: `${comparableProducts.length} candidate(s) in one request` }
     );
 
-    return { textScores, shortlist };
+    return matchResponse.data;
 }
-
-const NO_SHORTLIST_ERROR = `No candidate passed the text pre-filter (title > ${PREFILTER_MIN_TITLE}, brand > ${PREFILTER_MIN_BRAND})`;
 
 // Applies the "all four scores >= 0.85" rule (unchanged threshold) and
 // returns the first candidate that clears it, or null.
@@ -512,7 +458,6 @@ async function productMatching(brands, projectId, category) {
         const outputFilePath = `products_matched_final_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
         const errorFilePath = `products_matching_errors_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
         const matchedFilePath = `products_matched_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
-        const textScoresFilePath = `products_text_scores_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
         const emptyFilePath = `emptyFile.json`
         const timingFilePath = timing.startRun(
             timing.timingLogPath(`${sourceProducts[0].brand}_${projectId}_${Date.now()}`),
@@ -617,25 +562,8 @@ async function productMatching(brands, projectId, category) {
             console.log("Found products in batch:", productBatches.length);
 
             let matchData = [];
-            let shortlist = [];
             try {
-                // Pass 1: text-only scores for every candidate, recorded in
-                // their own file before pass 2 so they survive a pass-2 failure.
-                const scored = await scoreAndShortlist(sourceProduct, productBatches);
-                shortlist = scored.shortlist;
-
-                await appendToFile(textScoresFilePath, {
-                    sourceProduct: sourceProduct,
-                    matchedProducts: scored.textScores,
-                });
-
-                console.log("Shortlisted for image check:", shortlist.length, "of", productBatches.length);
-
-                // Pass 2: image similarity for the shortlist only. This is
-                // what the result files below are built from.
-                if (shortlist.length > 0) {
-                    matchData = await callMatchingService(sourceProduct, shortlist, { includeImageSimilarity: true });
-                }
+                matchData = await callMatchingService(sourceProduct, productBatches);
             } catch (error) {
                 console.log(error);
                 console.error("Error matching products:", error);
@@ -646,25 +574,6 @@ async function productMatching(brands, projectId, category) {
                 });
 
                 continue; // Skip to the next source product if there's an error
-            }
-
-            // Nothing was close enough on text to be worth an image check —
-            // recorded the same way as "no candidate cleared the threshold".
-            if (shortlist.length === 0) {
-                console.log("No candidates passed the text pre-filter for:", sourceProduct.title);
-                timing.logEvent("Result: no candidate passed the text pre-filter");
-
-                await appendToFile(errorFilePath, {
-                    sourceProduct: sourceProduct,
-                    error: NO_SHORTLIST_ERROR
-                });
-
-                await appendToFile(outputFilePath, {
-                    sourceProduct: sourceProduct,
-                    matchedProducts: {}
-                });
-
-                continue;
             }
 
             if (matchData.length === 0) {
@@ -761,10 +670,6 @@ async function productMatching(brands, projectId, category) {
                     path: fs.existsSync(matchedFilePath) ? matchedFilePath : emptyFilePath,
                 },
                 {
-                    filename: 'products_text_scores.json',
-                    path: fs.existsSync(textScoresFilePath) ? textScoresFilePath : emptyFilePath,
-                },
-                {
                     filename: 'product_matching_timing.log',
                     path: timingFilePath,
                 }
@@ -840,7 +745,6 @@ async function runBrandMatching(brandName, projectId, skus = null) {
     const runId = Date.now();
     const errorFilePath = `brand_matching_errors_${brandName}_${projectId}_${runId}.json`;
     const matchedFilePath = `brand_matching_raw_${brandName}_${projectId}_${runId}.json`;
-    const textScoresFilePath = `brand_matching_text_scores_${brandName}_${projectId}_${runId}.json`;
     const excelFilePath = `brand_matching_${brandName}_${projectId}_${runId}.xlsx`;
     const timingFilePath = timing.startRun(
         timing.timingLogPath(`brand_${brandName}_${projectId}_${runId}`),
@@ -878,34 +782,11 @@ async function runBrandMatching(brandName, projectId, skus = null) {
                     continue;
                 }
 
-                // Pass 1 (text only, every candidate) goes to its own file;
-                // pass 2 (image, shortlist only) feeds the raw file and Excel.
                 let matchData = [];
-                let shortlist = [];
                 try {
-                    const scored = await scoreAndShortlist(sourceProduct, candidates);
-                    shortlist = scored.shortlist;
-                    await appendToFile(textScoresFilePath, { direction, target: targetConfig.label, sourceProduct, matchedProducts: scored.textScores });
-
-                    if (shortlist.length > 0) {
-                        matchData = await callMatchingService(sourceProduct, shortlist, { includeImageSimilarity: true });
-                    }
+                    matchData = await callMatchingService(sourceProduct, candidates);
                 } catch (err) {
                     await appendToFile(errorFilePath, { direction, target: targetConfig.label, sourceProduct, error: err.message });
-                    continue;
-                }
-
-                if (shortlist.length === 0) {
-                    timing.logEvent("Result: no candidate passed the text pre-filter");
-                    await appendToFile(errorFilePath, { direction, target: targetConfig.label, sourceProduct, error: NO_SHORTLIST_ERROR });
-                    allResults.push({
-                        targetLabel: targetConfig.label,
-                        direction,
-                        sourceProduct,
-                        matched: false,
-                        matchedProduct: null,
-                        fieldScores: null,
-                    });
                     continue;
                 }
 
@@ -975,7 +856,6 @@ async function runBrandMatching(brandName, projectId, skus = null) {
             { filename: 'product_matching_results.xlsx', path: excelFilePath },
             { filename: 'product_matching_raw.json', path: fs.existsSync(matchedFilePath) ? matchedFilePath : `emptyFile.json` },
             { filename: 'product_matching_errors.json', path: fs.existsSync(errorFilePath) ? errorFilePath : `emptyFile.json` },
-            { filename: 'product_matching_text_scores.json', path: fs.existsSync(textScoresFilePath) ? textScoresFilePath : `emptyFile.json` },
             { filename: 'product_matching_timing.log', path: timingFilePath },
         ]
     };
