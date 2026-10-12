@@ -30,9 +30,14 @@ function timestamp(date = new Date()) {
 }
 
 function formatDuration(ms) {
-  if (ms < 60000) return `${(ms / 1000).toFixed(2)}s`;
-  const minutes = Math.floor(ms / 60000);
-  const seconds = ((ms % 60000) / 1000).toFixed(1);
+  // 59995ms and up would print "60.00s" at two decimals, so it takes the
+  // minutes form.
+  if (ms < 59995) return `${(ms / 1000).toFixed(2)}s`;
+  // Round once, to tenths, before splitting into minutes and seconds —
+  // rounding only the seconds part printed 119960ms as "1m 60.0s".
+  const tenths = Math.round(ms / 100);
+  const minutes = Math.floor(tenths / 600);
+  const seconds = ((tenths % 600) / 10).toFixed(1);
   return `${minutes}m ${seconds}s`;
 }
 
