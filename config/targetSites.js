@@ -1,4 +1,15 @@
+const path = require("path");
 const xpath = require("xpath");
+
+// config.json is the repo's home for deploy-time overrides (see
+// config/proxy.js); a missing file just means "use the defaults".
+const fileConfig = (() => {
+  try {
+    return require(path.join(__dirname, "..", "config.json"));
+  } catch (err) {
+    return {};
+  }
+})();
 
 // Each entry describes everything that is specific to one target website:
 // how to search it, how to read a search-results page, and (if needed) how
@@ -13,8 +24,13 @@ const xpath = require("xpath");
 // is genuinely part of a site's config, so a future target can opt into a
 // different one without touching the matching engine.
 //
-// There are three ways a target can turn one search into full candidate
-// objects. buildCandidatesFromSearch() in index.js checks them in this order:
+// A target with `searchApi` skips everything below: its own search API
+// returns full candidates in one request, with no search page involved. Used
+// for Mumzworld (its Algolia index).
+//
+// Otherwise there are three ways a target can turn one search page into full
+// candidate objects. buildCandidatesFromSearch() in index.js checks them in
+// this order:
 //
 // 1. `detailApi` -> read the SKUs off the search page, then fetch every
 //    candidate's data from the site's own JSON endpoint in one batched request.
@@ -477,6 +493,124 @@ const targetSites = {
       }).filter((p) => p.url);
     },
   },
+
+  mumzworld: {
+    id: "mumzworld",
+    label: "Mumzworld",
+    // Mode S (searchApi): Mumzworld's search box queries its Algolia index
+    // straight from the browser, and every hit already carries name, SKU, URL,
+    // full image gallery, price and categories — so one request yields every
+    // candidate, with no search page to parse and no product page per
+    // candidate. Verified live 2026-10-12.
+    //
+    // Not the catalog GraphQL API (catalog.mumzworld.com/graphql): its
+    // `products(search: ...)` argument is accepted but ignored — it returns the
+    // same default listing for any query. It only filters by attribute
+    // (brand id, SKU), which is fine for a brand crawl but not a title search.
+    searchApi: {
+      // The app id, index and search key are what the storefront itself uses;
+      // it serves them to every visitor in storeConfig.algoliaSettings
+      // (www.mumzworld.com/graphql). That endpoint answers non-browser clients
+      // with a 403, so they can't be read at runtime — hence the defaults here.
+      // The key is Algolia's public, search-only kind. If Mumzworld rotates it,
+      // searches start failing with HTTP 403: read the new one from the
+      // x-algolia-api-key parameter of the *.algolia.net request the search
+      // page makes, and set MUMZWORLD_ALGOLIA_API_KEY (env) or
+      // MUMZWORLD_Algolia_Api_Key (config.json) — no code change needed.
+      appId: "0LZ0827VB4",
+      apiKey: process.env.MUMZWORLD_ALGOLIA_API_KEY || fileConfig.MUMZWORLD_Algolia_Api_Key || "dc4a1be8e6ca1550969280e60a40a0d3",
+      // Saudi English store, matching Nahdi's en-sa and the SAR prices on both.
+      indexName: "magento2_aws_live_sa-en_products",
+      // Same candidate count as a Nahdi search page.
+      hitsPerPage: 20,
+
+      // A GET with the credentials in headers (not the query string), so the
+      // key never lands in a logged URL. fetchJson() supplies the proxy,
+      // browser headers and retries.
+      buildUrl(query) {
+        return (
+          `https://${this.appId}-dsn.algolia.net/1/indexes/${encodeURIComponent(this.indexName)}` +
+          `?query=${encodeURIComponent(query)}&hitsPerPage=${this.hitsPerPage}&distinct=true`
+        );
+      },
+      headers() {
+        return {
+          "x-algolia-application-id": this.appId,
+          "x-algolia-api-key": this.apiKey,
+          origin: "https://www.mumzworld.com",
+          referer: "https://www.mumzworld.com/",
+        };
+      },
+      extractHits: (response) => (Array.isArray(response?.hits) ? response.hits : []),
+
+      // Same candidate shape as Nahdi's extractDetail, so the matching
+      // service sees no difference between destinations.
+      mapHit(hit) {
+        const sar = hit.price?.SAR || {};
+        const price = round2(sar.default);
+        const mrp = round2(sar.default_original) || price;
+
+        return {
+          url: hit.url || "",
+          // Full path, the same "Default Category > ... > Leaf" form as the
+          // Mumzworld rows in ScratchProducts.
+          category: Array.isArray(hit.categories_without_path_base) ? hit.categories_without_path_base.join(" > ") : "",
+          brand: mumzworldBrand(hit),
+          title: hit.name || "",
+          sku: String(hit.sku || ""),
+          price,
+          mrp,
+          totalRating: "",
+          totalReview: "",
+          express: false,
+          // Not carried by the index.
+          description: "",
+          images: mumzworldImages(hit),
+        };
+      },
+    },
+  },
 };
+
+// Prices in the index carry float noise (28.9996 for a 29.00 shelf price).
+function round2(value) {
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
+}
+
+// The index has a `brand` on most products but not all — verified 31 of 40
+// hits across six searches, and the catalog GraphQL API has brand: null for
+// the same products, so there's nowhere else to get it. Mumzworld's names
+// lead with the brand ("Beesline - Whitening Facial Soap - 85 gm"); where both
+// exist the prefix equals the brand on 29 of 31. So: the brand field when
+// present, else the name's leading segment. A blank brand would score 0 on
+// the brand gate and reject the candidate outright, so the fallback can only
+// help.
+function mumzworldBrand(hit) {
+  if (typeof hit.brand === "string" && hit.brand.trim()) return hit.brand.trim();
+  const name = typeof hit.name === "string" ? hit.name : "";
+  return name.includes(" - ") ? name.split(" - ")[0].trim() : "";
+}
+
+// Full gallery in display order. Entry files are paths below the product
+// media root ("/a/e/foo.jpg" or "FOO-1.jpg"); image_url carries the resized
+// cache prefix the storefront serves them from, so reuse that prefix rather
+// than hardcoding its hash. Every URL built this way was fetched 200
+// image/jpeg on 2026-10-12, the first one equal to image_url.
+function mumzworldImages(hit) {
+  const cachePrefix = typeof hit.image_url === "string"
+    ? (hit.image_url.match(/^(.*\/media\/catalog\/product\/cache\/[^/]+)\//) || [])[1]
+    : null;
+
+  const files = (Array.isArray(hit.media_gallery_entries) ? hit.media_gallery_entries : [])
+    .filter((entry) => entry && !entry.disabled && entry.file)
+    .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+    .map((entry) => entry.file);
+
+  if (cachePrefix && files.length > 0) {
+    return files.map((file) => `${cachePrefix}/${String(file).replace(/^\//, "")}`);
+  }
+  return hit.image_url ? [hit.image_url] : [];
+}
 
 module.exports = targetSites;
