@@ -135,7 +135,10 @@ const targetSites = {
       return {
         url: link,
         category: product?.category || crumbs.join(" > ") || "",
-        brand: product?.brand?.name || product?.brand || "",
+        // JSON-LD brand is either a bare string or a Brand object. A Brand
+        // with name: null must become "", not fall through to the object —
+        // the matching service 422s the whole batch on a non-string brand.
+        brand: (typeof product?.brand === "string" ? product.brand : product?.brand?.name) || "",
         title: product?.name || xpath.select("//h1", doc)?.[0]?.textContent?.trim() || "",
         sku,
         price,

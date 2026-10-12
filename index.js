@@ -296,10 +296,56 @@ async function buildCandidatesFromDetailPages(targetConfig, doc, query) {
     return candidates;
 }
 
+// Fields the matching service validates as strings. One non-string value in
+// any of them gets the WHOLE batch rejected with a 422 — seen with Nahdi's
+// JSON-LD `brand: {"@type":"Brand","name":null}` — so they're coerced here
+// whatever a site extractor produced.
+const MATCH_TEXT_FIELDS = ["title", "brand", "category", "description", "sku", "url"];
+
+function toText(value) {
+    if (typeof value === "string") return value;
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+    // Schema.org-style objects ({ "@type": "Brand", "name": ... }).
+    if (value && typeof value === "object" && typeof value.name === "string") return value.name;
+    return "";
+}
+
+// Returns a copy for the request body; the caller's object is left as-is.
+// null/undefined pass through untouched — the service already accepts those
+// (it echoes `description: null` back), and turning them into "" isn't ours
+// to decide.
+function withStringTextFields(product) {
+    const copy = { ...product };
+    for (const field of MATCH_TEXT_FIELDS) {
+        if (copy[field] != null && typeof copy[field] !== "string") {
+            copy[field] = toText(copy[field]);
+        }
+    }
+    return copy;
+}
+
+// Rewraps an axios failure so its message carries the service's own reason —
+// FastAPI's 422 `detail` says which field of which candidate it rejected,
+// which "Request failed with status code 422" does not. That message is what
+// lands in the errors file and the timing log. The batch's SKUs are included
+// because `detail` locates a candidate only by its index in the batch.
+function matchingServiceError(err, batch) {
+    if (!err.response) return err;
+
+    const body = typeof err.response.data === "string" ? err.response.data : JSON.stringify(err.response.data);
+    const reason = body && body.length > 1000 ? `${body.slice(0, 1000)}…` : body;
+    const skus = batch.map((p) => p.sku).join(", ");
+
+    const wrapped = new Error(`Matching service returned HTTP ${err.response.status}: ${reason} (batch SKUs: ${skus})`);
+    wrapped.status = err.response.status;
+    wrapped.responseData = err.response.data;
+    return wrapped;
+}
+
 // Sends originalProduct + candidates to the matching microservice in
 // batches of 5 (unchanged from the original Nahdi flow) and returns the
 // flattened field-score results. Image similarity is the expensive part of a
-// call, so it's opt-in — see matchWithImagePrefilter().
+// call, so it's opt-in — see scoreAndShortlist().
 async function callMatchingService(originalProduct, comparableProducts, { includeImageSimilarity = true } = {}) {
     originalProduct.price = originalProduct.price ? parseFloat(originalProduct.price) : 0;
     originalProduct.mrp = originalProduct.mrp ? parseFloat(originalProduct.mrp) : 0;
@@ -326,8 +372,8 @@ async function callMatchingService(originalProduct, comparableProducts, { includ
                 'X-API-Key': "test123#"
             },
             data: {
-                "original_product": originalProduct,
-                "comparable_products": batch,
+                "original_product": withStringTextFields(originalProduct),
+                "comparable_products": batch.map(withStringTextFields),
                 "include_image_similarity": includeImageSimilarity
             },
             timeout: 120000
@@ -335,7 +381,7 @@ async function callMatchingService(originalProduct, comparableProducts, { includ
 
         const matchResponse = await timing.step(
             `${passLabel} batch ${i / batchSize + 1}/${batchCount}`,
-            () => axios.request(config),
+            () => axios.request(config).catch((err) => { throw matchingServiceError(err, batch); }),
             { detail: `${batch.length} candidate(s)` }
         );
         matchData = matchData.concat(matchResponse.data);
