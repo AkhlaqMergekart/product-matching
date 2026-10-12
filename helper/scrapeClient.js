@@ -1,5 +1,6 @@
 const { fetchViaBrowser, closeBrowser } = require("./browserClient.js");
 const { fetchPage, closeSession } = require("./httpClient.js");
+const { logEvent } = require("./timingLogger.js");
 
 // Fetches `url` with whichever strategy `scraperType` names, retrying up to 3
 // times. Both strategies route every request through the Webshare proxy, so
@@ -45,6 +46,7 @@ async function fetchHtml(scraperType, url, options = {}) {
       return await fetchViaBrowser(url, options);
     } catch (err) {
       lastError = err;
+      logEvent(`  browser fetch attempt ${attempt}/3 failed — ${err.message}`);
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
