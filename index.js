@@ -186,12 +186,49 @@ async function buildCandidatesFromApi(targetConfig, doc, query) {
     return candidates;
 }
 
+// Mode S: the target's own search API answers a query with full candidates in
+// one request (Mumzworld's Algolia index), so there is no search page to parse
+// and no fetch per candidate. Throws when the request fails, so each caller
+// keeps its own posture — the legacy flow retries, the brand flow skips.
+async function buildCandidatesFromSearchApi(targetConfig, query) {
+    const api = targetConfig.searchApi;
+
+    // Logged with the query, not the URL: the request is a GET whose
+    // credentials travel in headers, but the query is what's worth reading.
+    const response = await timing.step(
+        `${targetConfig.label} search API`,
+        () => fetchJson(api.buildUrl(query), { headers: api.headers() }),
+        { detail: query, summarize: (r) => `${api.extractHits(r).length} result(s)` }
+    );
+
+    const candidates = [];
+    for (const hit of api.extractHits(response)) {
+        try {
+            candidates.push(api.mapHit(hit));
+        } catch (err) {
+            console.error(`Error mapping ${targetConfig.label} search result:`, err.message);
+        }
+    }
+
+    timing.logEvent(`${targetConfig.label} search API: ${candidates.length} candidate(s)`);
+    return candidates;
+}
+
 // Searches `targetConfig`'s site for `query` and returns a full list of
 // candidate product objects, ready to hand to the matching service. This is
 // the piece that used to be hardcoded to Nahdi — every site-specific fact
 // (search URL, listing/detail selectors, which fetch strategy to use) comes
 // from targetConfig (config/targetSites.js) instead.
 async function buildCandidatesFromSearch(targetConfig, query) {
+    if (targetConfig.searchApi) {
+        try {
+            return await buildCandidatesFromSearchApi(targetConfig, query);
+        } catch (err) {
+            console.error(`Error searching ${targetConfig.label} for "${query}":`, err.message);
+            return [];
+        }
+    }
+
     const searchUrl = targetConfig.buildSearchUrl(query);
 
     let searchHtml;
@@ -411,22 +448,35 @@ function pickBestMatch(matchData) {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy Mumzworld -> Nahdi flow (original, unrefactored implementation).
-// Pulls source rows by SKU list + projectId, loads the Nahdi search page in a
-// headless browser via the Webshare proxy, reads every candidate from Nahdi's
-// own product API in one batched call, and matches against the matching
-// microservice. Existing callers of POST /product-matching keep working
-// exactly as before.
+// SKU-list flow behind POST /product-matching. Pulls source rows by SKU list +
+// projectId, searches the destination marketplace for each one by title, and
+// matches the candidates against the matching microservice.
+//
+// `destination` picks the marketplace searched (MATCHING_DESTINATIONS):
+//   "nahdi"     -> Nahdi search page, then one product page per candidate
+//                  (the original flow, and the default, so existing callers
+//                  are unchanged).
+//   "mumzworld" -> Mumzworld's search API, which returns every candidate in
+//                  one request. Source rows are whatever the project holds,
+//                  e.g. Nahdi products scraped into ScratchProducts.
 // ---------------------------------------------------------------------------
-async function productMatching(brands, projectId, category) {
+const MATCHING_DESTINATIONS = ["nahdi", "mumzworld"];
+
+async function productMatching(brands, projectId, category, destination = "nahdi") {
     try {
 
-        console.log("Starting product matching for brand:", brands.join(", "), "and projectId:", projectId, "and category:", category || "All");
+        console.log("Starting product matching for brand:", brands.join(", "), "and projectId:", projectId, "and category:", category || "All", "and destination:", destination);
 
         if (!brands || brands.length == 0 || !projectId) {
             console.error("Brand and projectId are required parameters.");
             throw new Error("Brand and projectId are required parameters.");
         }
+
+        if (!MATCHING_DESTINATIONS.includes(destination) || !targetSites[destination]) {
+            throw new Error(`Unknown destination "${destination}"; expected one of: ${MATCHING_DESTINATIONS.join(", ")}.`);
+        }
+
+        const targetConfig = targetSites[destination];
 
         // The browser is launched (and the Webshare proxy authenticated)
         // lazily by helper/browserClient.js on the first fetch below. This
@@ -461,7 +511,7 @@ async function productMatching(brands, projectId, category) {
         const emptyFilePath = `emptyFile.json`
         const timingFilePath = timing.startRun(
             timing.timingLogPath(`${sourceProducts[0].brand}_${projectId}_${Date.now()}`),
-            `Nahdi matching for brand ${brand}, project ${projectId}, ${sourceProducts.length} SKU(s)`
+            `${targetConfig.label} matching for brand ${brand}, project ${projectId}, ${sourceProducts.length} SKU(s)`
         );
 
         for (var x = 0; x < sourceProducts.length; x++) {
@@ -484,22 +534,28 @@ async function productMatching(brands, projectId, category) {
             // Throttle between products to stay under proxy / site rate limits.
             await delay(1500);
 
-            const url = `https://www.nahdionline.com/en-sa/search?query=${encodeURIComponent(sourceProduct.title)}`;
+            // A search-API destination (Mumzworld) returns the candidates
+            // from this one request; a search-page destination (Nahdi)
+            // returns HTML, turned into candidates below.
+            const usesSearchApi = Boolean(targetConfig.searchApi);
+            const url = usesSearchApi ? null : targetConfig.buildSearchUrl(sourceProduct.title);
 
-            console.log(x, sourceProduct.title, url);
+            console.log(x, sourceProduct.title, url || `(${targetConfig.label} search API)`);
 
-            let htmlResponse = null;
+            let searchResult = null;
             try {
                 // One attempt per pass — the retryCount loop below is what
                 // retries, exactly as it did when this escalated ScrapeOps'
                 // premium tier on retryCount >= 2. There's no tier to
                 // escalate now; a retry gets a fresh browser context and
                 // therefore a fresh rotating exit IP instead.
-                htmlResponse = await timing.step(
-                    "Nahdi search page fetch",
-                    () => fetchPage(url),
-                    { detail: url, summarize: describeHtml }
-                );
+                searchResult = usesSearchApi
+                    ? await buildCandidatesFromSearchApi(targetConfig, sourceProduct.title)
+                    : await timing.step(
+                        `${targetConfig.label} search page fetch`,
+                        () => fetchPage(url),
+                        { detail: url, summarize: describeHtml }
+                    );
             } catch (err) {
                 console.error("Error navigating to URL:", err);
                 retryCount++;
@@ -517,41 +573,45 @@ async function productMatching(brands, projectId, category) {
 
             }
 
-            const $ = cheerio.load(htmlResponse);
-
-            const doc = new dom().parseFromString($.xml(), 'text/xml');
-
-            // Shares the brand flow's dispatch (config/targetSites.js decides
-            // the mode), so the two flows can't drift apart on how a Nahdi
-            // product is read and the listing selector exists in exactly one
-            // place. It does its own link extraction and its own empty check,
-            // which is why the extraction that used to sit here is gone — the
-            // productBatches.length check below covers the empty case.
-            //
-            // This is where the win is for a blocked run: the ~20 full Chrome
-            // navigations per source product are now ~20 plain GETs sharing one
-            // held-open proxy tunnel.
             let productBatches = [];
-            try {
-                productBatches = await timing.step(
-                    "Nahdi candidate collection",
-                    () => buildCandidatesFromDoc(targetSites.nahdi, doc, sourceProduct.title),
-                    { summarize: (c) => `${c.length} candidate(s)` }
-                );
-            } catch (error) {
-                console.error("Error building Nahdi candidates:", error);
+            if (usesSearchApi) {
+                productBatches = searchResult;
+            } else {
+                const $ = cheerio.load(searchResult);
 
-                await appendToFile(errorFilePath, {
-                    sourceProduct: sourceProduct,
-                    error: error.message
-                });
+                const doc = new dom().parseFromString($.xml(), 'text/xml');
 
-                continue; // Skip to the next source product if there's an error
+                // Shares the brand flow's dispatch (config/targetSites.js decides
+                // the mode), so the two flows can't drift apart on how a Nahdi
+                // product is read and the listing selector exists in exactly one
+                // place. It does its own link extraction and its own empty check,
+                // which is why the extraction that used to sit here is gone — the
+                // productBatches.length check below covers the empty case.
+                //
+                // This is where the win is for a blocked run: the ~20 full Chrome
+                // navigations per source product are now ~20 plain GETs sharing one
+                // held-open proxy tunnel.
+                try {
+                    productBatches = await timing.step(
+                        `${targetConfig.label} candidate collection`,
+                        () => buildCandidatesFromDoc(targetConfig, doc, sourceProduct.title),
+                        { summarize: (c) => `${c.length} candidate(s)` }
+                    );
+                } catch (error) {
+                    console.error(`Error building ${targetConfig.label} candidates:`, error);
+
+                    await appendToFile(errorFilePath, {
+                        sourceProduct: sourceProduct,
+                        error: error.message
+                    });
+
+                    continue; // Skip to the next source product if there's an error
+                }
             }
 
             if (productBatches.length === 0) {
                 console.log("No products found for:", sourceProduct.title);
-                timing.logEvent("Result: no products found on Nahdi");
+                timing.logEvent(`Result: no products found on ${targetConfig.label}`);
                 await appendToFile(errorFilePath, {
                     sourceProduct: sourceProduct,
                     error: "No products found"
@@ -654,8 +714,8 @@ async function productMatching(brands, projectId, category) {
         const mailOptions = {
             from: config.FROM_EMAIL,
             to: "akhlaq@mergekart.com",
-            subject: `Product Matching Report for ${brand} - ${projectId}`,
-            text: `Product matching completed successfully for brand: ${brand} and projectId: ${projectId}. Total matched products: ${allProducts.length}`,
+            subject: `Product Matching Report for ${brand} - ${projectId} (${targetConfig.label})`,
+            text: `Product matching against ${targetConfig.label} completed successfully for brand: ${brand} and projectId: ${projectId}. Total matched products: ${allProducts.length}`,
             attachments: [
                 {
                     filename: 'products_matched_final.json',
@@ -700,8 +760,8 @@ async function productMatching(brands, projectId, category) {
         const mailOptions = {
             from: config.FROM_EMAIL,
             to: "akhlaq@mergekart.com",
-            subject: `Product Matching Error for ${brands.join(", ")} - ${projectId}`,
-            text: `An error occurred during product matching for brand: ${brands.join(", ")} and projectId: ${projectId}. Error: ${err.message}`,
+            subject: `Product Matching Error for ${brands.join(", ")} - ${projectId} (${destination})`,
+            text: `An error occurred during product matching against ${destination} for brand: ${brands.join(", ")} and projectId: ${projectId}. Error: ${err.message}`,
         };
 
         await sendUpdateReportEmail(mailOptions);
@@ -871,18 +931,25 @@ app.use(express.urlencoded({ extended: true }));
 const config = require("./config.json");
 const { Op } = require('sequelize');
 
+// Body: { brand: [<source SKUs>], projectId, category?, destination? }.
+// `destination` is the marketplace searched for each source product — "nahdi"
+// (default) or "mumzworld".
 app.post('/product-matching', async (req, res) => {
-    const { brand, projectId, category } = req.body;
+    const { brand, projectId, category, destination = "nahdi" } = req.body;
     console.log(brand)
     if (!brand || brand.length == 0 || !projectId) {
         return res.status(400).json({ error: "Brand and projectId are required parameters." });
+    }
+
+    if (!MATCHING_DESTINATIONS.includes(destination)) {
+        return res.status(400).json({ error: `destination must be one of: ${MATCHING_DESTINATIONS.join(", ")}.` });
     }
 
     try {
 
         res.status(200).json({ message: "Product matching started successfully." });
 
-        await timing.withTimingContext(() => productMatching(brand, projectId, category));
+        await timing.withTimingContext(() => productMatching(brand, projectId, category, destination));
 
         console.log("Product matching completed successfully.");
     } catch (error) {
