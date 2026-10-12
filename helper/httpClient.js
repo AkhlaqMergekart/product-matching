@@ -2,6 +2,7 @@ const axios = require("axios");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const { PROXY_HOST, PROXY_PORT, PROXY_USERNAME, PROXY_PASSWORD } = require("../config/proxy.js");
 const { isBlockPage } = require("./blockDetect.js");
+const { logEvent } = require("./timingLogger.js");
 
 // Plain HTTP fetching, every call masked behind the Webshare proxy, with a
 // STICKY exit IP that is only given up when it stops working.
@@ -168,6 +169,8 @@ async function fetchWithRotation(url, options, expectJson) {
       if (err instanceof PermanentHttpError) {
         throw err;
       }
+
+      logEvent(`  fetch attempt ${i}/${MAX_ATTEMPTS} failed — ${err.message}`);
 
       if (i < MAX_ATTEMPTS) {
         rotateSession(err.message);

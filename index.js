@@ -8,6 +8,7 @@ const sendUpdateReportEmail = require("./helper/sendUpdateReport.js");
 const { fetchHtml, closeFetchClients } = require("./helper/scrapeClient.js");
 const { fetchPage, fetchJson } = require("./helper/httpClient.js");
 const { exportResultsToExcel } = require("./helper/exportResults.js");
+const timing = require("./helper/timingLogger.js");
 const targetSites = require("./config/targetSites.js");
 const brandTargets = require("./config/brandTargets.js");
 
@@ -58,6 +59,11 @@ function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Ended-line summary for a fetched page in the timing log.
+function describeHtml(html) {
+    return typeof html === "string" ? `${Math.round(html.length / 1024)} KB` : "";
+}
+
 // Second pass for targets whose listing grid is *mostly* complete but drops a
 // field on some cards. Fetches the product page for only those candidates,
 // rather than making every candidate pay for the few that are short.
@@ -82,7 +88,8 @@ async function enrichMissingBrands(targetConfig, candidates) {
     // Cache by URL so repeated ASINs in one result set cost one fetch.
     const seen = new Map();
 
-    for (const candidate of toFetch) {
+    for (let i = 0; i < toFetch.length; i++) {
+        const candidate = toFetch[i];
         const url = cfg.buildUrl(candidate);
         if (!url) continue;
 
@@ -94,7 +101,11 @@ async function enrichMissingBrands(targetConfig, candidates) {
         await delay(1000);
 
         try {
-            const html = await fetchHtml(targetConfig.scraper, url, cfg.scraperOptions || targetConfig.scraperOptions);
+            const html = await timing.step(
+                `${targetConfig.label} brand fallback page ${i + 1}/${toFetch.length} fetch`,
+                () => fetchHtml(targetConfig.scraper, url, cfg.scraperOptions || targetConfig.scraperOptions),
+                { detail: url }
+            );
             const $ = cheerio.load(html);
             const brand = cfg.extract(new dom().parseFromString($.xml(), "text/xml")) || "";
             seen.set(url, brand);
@@ -127,7 +138,10 @@ async function buildCandidatesFromApi(targetConfig, doc, query) {
     // once, and the endpoint would just return it twice.
     const uniqueSkus = [...new Set(skus)];
     const batchSize = cfg.batchSize || uniqueSkus.length;
+    const batchCount = Math.ceil(uniqueSkus.length / batchSize);
     const candidates = [];
+
+    timing.logEvent(`${targetConfig.label} search page: ${uniqueSkus.length} product SKU(s) extracted`);
 
     for (let i = 0; i < uniqueSkus.length; i += batchSize) {
         const batch = uniqueSkus.slice(i, i + batchSize);
@@ -138,7 +152,14 @@ async function buildCandidatesFromApi(targetConfig, doc, query) {
 
         let items;
         try {
-            items = await fetchJson(cfg.buildUrl(batch));
+            items = await timing.step(
+                `${targetConfig.label} product API batch ${i / batchSize + 1}/${batchCount} fetch`,
+                () => fetchJson(cfg.buildUrl(batch)),
+                {
+                    detail: `${batch.length} SKU(s)`,
+                    summarize: (res) => (Array.isArray(res) ? `${res.length} item(s)` : ""),
+                }
+            );
         } catch (err) {
             // Lose this batch, keep the rest — same posture as a failed detail
             // page in the per-candidate path below.
@@ -175,7 +196,11 @@ async function buildCandidatesFromSearch(targetConfig, query) {
 
     let searchHtml;
     try {
-        searchHtml = await fetchHtml(targetConfig.scraper, searchUrl, targetConfig.scraperOptions);
+        searchHtml = await timing.step(
+            `${targetConfig.label} search page fetch`,
+            () => fetchHtml(targetConfig.scraper, searchUrl, targetConfig.scraperOptions),
+            { detail: searchUrl, summarize: describeHtml }
+        );
     } catch (err) {
         console.error(`Error searching ${targetConfig.label} for "${query}":`, err.message);
         return [];
@@ -204,6 +229,7 @@ async function buildCandidatesFromDoc(targetConfig, doc, query) {
         // better than returning nothing for this source product.
         if (candidates.length === 0 && targetConfig.detailApi) {
             console.log(`  ${targetConfig.label}: no candidates from product pages, falling back to the bulk product API`);
+            timing.logEvent(`${targetConfig.label}: no candidates from product pages, falling back to the bulk product API`);
             return buildCandidatesFromApi(targetConfig, doc, query);
         }
 
@@ -219,6 +245,7 @@ async function buildCandidatesFromDoc(targetConfig, doc, query) {
     // Mode C: some targets (Amazon UAE) carry enough data on the search-results
     // page itself, so there's no second request at all.
     const candidates = targetConfig.extractListingProducts(doc);
+    timing.logEvent(`${targetConfig.label} search page: ${candidates.length} candidate(s) extracted`);
     return enrichMissingBrands(targetConfig, candidates);
 }
 
@@ -231,6 +258,8 @@ async function buildCandidatesFromDetailPages(targetConfig, doc, query) {
         return [];
     }
 
+    timing.logEvent(`${targetConfig.label} search page: ${productLinks.length} product link(s) extracted`);
+
     const candidates = [];
     for (let i = 0; i < productLinks.length; i++) {
         const link = productLinks[i];
@@ -242,7 +271,11 @@ async function buildCandidatesFromDetailPages(targetConfig, doc, query) {
 
         let detailHtml = null;
         try {
-            detailHtml = await fetchHtml(targetConfig.scraper, link, targetConfig.scraperOptions);
+            detailHtml = await timing.step(
+                `${targetConfig.label} single product scrape ${i + 1}/${productLinks.length}`,
+                () => fetchHtml(targetConfig.scraper, link, targetConfig.scraperOptions),
+                { detail: link, summarize: describeHtml }
+            );
         } catch (err) {
             console.error(`Error fetching ${targetConfig.label} product page:`, link, err.message);
             continue; // Skip this link, keep processing the rest of the batch
@@ -272,6 +305,7 @@ async function callMatchingService(originalProduct, comparableProducts) {
 
     let matchData = [];
     const batchSize = 5;
+    const batchCount = Math.ceil(comparableProducts.length / batchSize);
 
     for (let i = 0; i < comparableProducts.length; i += batchSize) {
         const batch = comparableProducts.slice(i, i + batchSize);
@@ -297,7 +331,11 @@ async function callMatchingService(originalProduct, comparableProducts) {
             timeout: 120000
         };
 
-        const matchResponse = await axios.request(config);
+        const matchResponse = await timing.step(
+            `Product matching batch ${i / batchSize + 1}/${batchCount}`,
+            () => axios.request(config),
+            { detail: `${batch.length} candidate(s)` }
+        );
         matchData = matchData.concat(matchResponse.data);
     }
 
@@ -380,6 +418,10 @@ async function productMatching(brands, projectId, category) {
         const errorFilePath = `products_matching_errors_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
         const matchedFilePath = `products_matched_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
         const emptyFilePath = `emptyFile.json`
+        const timingFilePath = timing.startRun(
+            timing.timingLogPath(`${sourceProducts[0].brand}_${projectId}_${Date.now()}`),
+            `Nahdi matching for brand ${brand}, project ${projectId}, ${sourceProducts.length} SKU(s)`
+        );
 
         for (var x = 0; x < sourceProducts.length; x++) {
 
@@ -392,6 +434,11 @@ async function productMatching(brands, projectId, category) {
                 retryCount = 0;
                 lastProcessedIndex = x;
             }
+
+            timing.beginSku(
+                sourceProduct.sku,
+                `${x + 1}/${sourceProducts.length}${retryCount > 0 ? `, retry ${retryCount}` : ""}`
+            );
 
             // Throttle between products to stay under proxy / site rate limits.
             await delay(1500);
@@ -407,7 +454,11 @@ async function productMatching(brands, projectId, category) {
                 // premium tier on retryCount >= 2. There's no tier to
                 // escalate now; a retry gets a fresh browser context and
                 // therefore a fresh rotating exit IP instead.
-                htmlResponse = await fetchPage(url);
+                htmlResponse = await timing.step(
+                    "Nahdi search page fetch",
+                    () => fetchPage(url),
+                    { detail: url, summarize: describeHtml }
+                );
             } catch (err) {
                 console.error("Error navigating to URL:", err);
                 retryCount++;
@@ -441,10 +492,10 @@ async function productMatching(brands, projectId, category) {
             // held-open proxy tunnel.
             let productBatches = [];
             try {
-                productBatches = await buildCandidatesFromDoc(
-                    targetSites.nahdi,
-                    doc,
-                    sourceProduct.title
+                productBatches = await timing.step(
+                    "Nahdi candidate collection",
+                    () => buildCandidatesFromDoc(targetSites.nahdi, doc, sourceProduct.title),
+                    { summarize: (c) => `${c.length} candidate(s)` }
                 );
             } catch (error) {
                 console.error("Error building Nahdi candidates:", error);
@@ -459,6 +510,7 @@ async function productMatching(brands, projectId, category) {
 
             if (productBatches.length === 0) {
                 console.log("No products found for:", sourceProduct.title);
+                timing.logEvent("Result: no products found on Nahdi");
                 await appendToFile(errorFilePath, {
                     sourceProduct: sourceProduct,
                     error: "No products found"
@@ -471,11 +523,12 @@ async function productMatching(brands, projectId, category) {
             let matchData = [];
             try {
                 const batchSize = 5;
+                const batchCount = Math.ceil(productBatches.length / batchSize);
                 // Split the productBatches into smaller batches
                 for (let i = 0; i < productBatches.length; i += batchSize) {
                     const batch = productBatches.slice(i, i + batchSize);
 
-                    console.log("Matching batch:", i / batchSize + 1, "of", Math.ceil(productBatches.length / batchSize));
+                    console.log("Matching batch:", i / batchSize + 1, "of", batchCount);
 
                     sourceProduct.price = sourceProduct.price ? parseFloat(sourceProduct.price) : 0;
                     sourceProduct.mrp = sourceProduct.mrp ? parseFloat(sourceProduct.mrp) : 0;
@@ -503,7 +556,11 @@ async function productMatching(brands, projectId, category) {
                         timeout: 120000
                     };
 
-                    const matchResponse = await axios.request(config);
+                    const matchResponse = await timing.step(
+                        `Product matching batch ${i / batchSize + 1}/${batchCount}`,
+                        () => axios.request(config),
+                        { detail: `${batch.length} candidate(s)` }
+                    );
 
                     matchData = matchData.concat(matchResponse.data);
 
@@ -568,6 +625,8 @@ async function productMatching(brands, projectId, category) {
                 continue; // Skip to the next source product if there's an error
             }
 
+            timing.logEvent(foundProductCount === 0 ? "Result: no candidate cleared the match threshold" : "Result: match found");
+
             if (foundProductCount === 0) {
                 console.log("No matching products found for:", sourceProduct.title);
 
@@ -591,6 +650,8 @@ async function productMatching(brands, projectId, category) {
 
         console.log("Product matching completed successfully.");
 
+        timing.endRun(`${sourceProducts.length} SKU(s), ${allProducts.length} row(s) in the final output`);
+
         const mailOptions = {
             from: config.FROM_EMAIL,
             to: "akhlaq@mergekart.com",
@@ -608,6 +669,10 @@ async function productMatching(brands, projectId, category) {
                 {
                     filename: 'products_matched.json',
                     path: fs.existsSync(matchedFilePath) ? matchedFilePath : emptyFilePath,
+                },
+                {
+                    filename: 'product_matching_timing.log',
+                    path: timingFilePath,
                 }
             ]
         };
@@ -632,6 +697,7 @@ async function productMatching(brands, projectId, category) {
 
     } catch (err) {
         console.error("Error:", err);
+        timing.endRun(`aborted: ${err.message}`);
         const mailOptions = {
             from: config.FROM_EMAIL,
             to: "akhlaq@mergekart.com",
@@ -681,6 +747,11 @@ async function runBrandMatching(brandName, projectId, skus = null) {
     const errorFilePath = `brand_matching_errors_${brandName}_${projectId}_${runId}.json`;
     const matchedFilePath = `brand_matching_raw_${brandName}_${projectId}_${runId}.json`;
     const excelFilePath = `brand_matching_${brandName}_${projectId}_${runId}.xlsx`;
+    const timingFilePath = timing.startRun(
+        timing.timingLogPath(`brand_${brandName}_${projectId}_${runId}`),
+        `brand matching for ${brandName}, project ${projectId}, ${localCatalog.length} SKU(s), ` +
+        `targets: ${targets.map((t) => `${t.target}/${t.direction}`).join(", ")}`
+    );
     const allResults = [];
 
     for (const { target: targetId, direction } of targets) {
@@ -695,11 +766,19 @@ async function runBrandMatching(brandName, projectId, skus = null) {
         if (direction === "forward") {
             // Same shape as the legacy flow: iterate our own catalog rows,
             // search the target for each one.
-            for (const sourceProduct of localCatalog) {
+            for (let p = 0; p < localCatalog.length; p++) {
+                const sourceProduct = localCatalog[p];
+                timing.beginSku(sourceProduct.sku, `${targetConfig.label} ${direction}, ${p + 1}/${localCatalog.length}`);
+
                 await delay(1500);
 
-                const candidates = await buildCandidatesFromSearch(targetConfig, sourceProduct.title);
+                const candidates = await timing.step(
+                    `${targetConfig.label} candidate collection`,
+                    () => buildCandidatesFromSearch(targetConfig, sourceProduct.title),
+                    { summarize: (c) => `${c.length} candidate(s)` }
+                );
                 if (candidates.length === 0) {
+                    timing.logEvent(`Result: no products found on ${targetConfig.label}`);
                     await appendToFile(errorFilePath, { direction, target: targetConfig.label, sourceProduct, error: "No products found" });
                     continue;
                 }
@@ -715,6 +794,7 @@ async function runBrandMatching(brandName, projectId, skus = null) {
                 await appendToFile(matchedFilePath, { direction, target: targetConfig.label, sourceProduct, matchedProducts: matchData });
 
                 const best = pickBestMatch(matchData);
+                timing.logEvent(best ? "Result: match found" : "Result: no candidate cleared the match threshold");
                 allResults.push({
                     targetLabel: targetConfig.label,
                     direction,
@@ -766,6 +846,8 @@ async function runBrandMatching(brandName, projectId, skus = null) {
 
     const matchedCount = allResults.filter((r) => r.matched).length;
 
+    timing.endRun(`${matchedCount}/${allResults.length} row(s) matched`);
+
     const mailOptions = {
         from: config.FROM_EMAIL,
         to: "akhlaq@mergekart.com",
@@ -775,6 +857,7 @@ async function runBrandMatching(brandName, projectId, skus = null) {
             { filename: 'product_matching_results.xlsx', path: excelFilePath },
             { filename: 'product_matching_raw.json', path: fs.existsSync(matchedFilePath) ? matchedFilePath : `emptyFile.json` },
             { filename: 'product_matching_errors.json', path: fs.existsSync(errorFilePath) ? errorFilePath : `emptyFile.json` },
+            { filename: 'product_matching_timing.log', path: timingFilePath },
         ]
     };
 
@@ -800,7 +883,7 @@ app.post('/product-matching', async (req, res) => {
 
         res.status(200).json({ message: "Product matching started successfully." });
 
-        await productMatching(brand, projectId, category);
+        await timing.withTimingContext(() => productMatching(brand, projectId, category));
 
         console.log("Product matching completed successfully.");
     } catch (error) {
@@ -838,7 +921,7 @@ app.post('/product-matching/brand', async (req, res) => {
     try {
         res.status(200).json({ message: "Brand product matching started successfully." });
 
-        const result = await runBrandMatching(brandName, projectId, skus);
+        const result = await timing.withTimingContext(() => runBrandMatching(brandName, projectId, skus));
 
         console.log("Brand product matching completed successfully.", result);
     } catch (error) {
