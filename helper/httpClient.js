@@ -3,6 +3,8 @@ const { HttpsProxyAgent } = require("https-proxy-agent");
 const { PROXY_HOST, PROXY_PORT, PROXY_USERNAME, PROXY_PASSWORD } = require("../config/proxy.js");
 const { isBlockPage } = require("./blockDetect.js");
 const { logEvent } = require("./timingLogger.js");
+const { tryScrapeOpsFallback } = require("./scrapeOpsClient.js");
+const { scrapeOpsIsFallback } = require("../config/scrapingVendors.js");
 
 // Plain HTTP fetching, every call masked behind the Webshare proxy, with a
 // STICKY exit IP that is only given up when it stops working.
@@ -182,6 +184,14 @@ async function fetchWithRotation(url, options, expectJson) {
   // The last attempt failed too — don't leave the next caller on a session
   // that has just proved itself bad.
   rotateSession(`gave up after ${MAX_ATTEMPTS} attempts`);
+
+  // Webshare is out of tries on this URL; hand it to the next vendor
+  // (config/scrapingVendors.js). With no ScrapeOps key configured this
+  // re-throws lastError, i.e. exactly the behaviour before the fallback
+  // existed.
+  if (scrapeOpsIsFallback()) {
+    return tryScrapeOpsFallback(url, { ...options, expectJson }, lastError);
+  }
 
   throw lastError;
 }

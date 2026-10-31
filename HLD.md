@@ -77,6 +77,7 @@ Each entry describes everything specific to one target site:
 | `detailApi` | (mode 1) Read SKUs off the search page, then fetch every candidate from the site's own JSON endpoint in one batched request. Holds `extractListingSkus(doc)`, `batchSize`, `buildUrl(skus)` and `mapItem(item)`. Used by Nahdi |
 | `needsDetailFetch` | (modes 2 and 3) `false` → build the full candidate directly off the search-results page, no per-candidate second request (Amazon UAE). `true` → visit each candidate's own product page for full fields (Firstcry UAE) |
 | `buildSearchUrl(query)` | Constructs the site's search URL for a query string |
+| `buildQuery(sourceProduct)` | Optional. What text to search this target with. Omitted → the source product's title alone (every target's behaviour before this existed). Myntra and Nykaa Fashion set it to **brand + title**, since their relevance ranking leans on the brand token and our source titles don't always carry it |
 | `extractListingLinks(doc)` | (detail-fetch sites only) pulls product links off the search-results page |
 | `extractDetail(doc, link)` | (detail-fetch sites only) parses a single product page into `{title, brand, price, mrp, images, ...}` |
 | `extractListingProducts(doc)` | (no-detail-fetch sites only) parses the search-results page directly into full candidate objects |
@@ -88,6 +89,21 @@ Each entry describes everything specific to one target site:
 | `nahdi` | `needsDetailFetch: true` (axios) | 1 search page + ~20 product pages, all plain GETs on one tunnel | No browser at all. Verified live 2026-10-06: 20/20 candidates in ~41s, 21 requests on a single exit IP with 0 rotations; full title/brand/price/MRP/images/description. `detailApi` is the fallback |
 | `firstcryAE` | `needsDetailFetch: true` | 1 browser page + 1 per candidate | Selectors verified live 2026-07-21; no confirmed MRP sample yet, falls back to price. Verified live through the proxy 2026-09-05. The most block-prone target — no known JSON endpoint yet |
 | `amazonAE` | `needsDetailFetch: false` | 1 browser page (+ capped brand top-ups) | Uses Amazon's stable `data-component-type='s-search-result'` + `data-asin` hooks instead of a utility-class selector already found to be stale. **See the proxy-reputation caveat in section 5** |
+| `myntra` | `needsDetailFetch: false` (axios) | 1 search page, a plain GET | Searched by **brand + title**, first page of results only. Candidates read off `window.__myx` — the JSON the site's own React app hydrates from — not the DOM, since the grid is rendered client-side. Verified live 2026-10-31: 690 KB → 50 candidates, 0 missing title/brand/price/images |
+| `nykaafashion` | `needsDetailFetch: false` (axios) | 1 search page, a plain GET | Same shape as Myntra, reading `<script id="__PRELOADED_STATE__">` → `listingV2.products`. Verified live 2026-10-31: 840 KB → 36 candidates, 0 incomplete. No category: the blob carries only numeric `categoryId`s with no names anywhere on the page |
+
+**Two field traps in these two, both verified against live samples rather than read off the field names:**
+
+- Nykaa Fashion's `title` is the **brand** (`"Nike"`) and `subTitle` is the **product**
+  (`"Men's Downshifter 14 Running Shoes"`). Taking `title` as the title — the obvious reading —
+  would compare every candidate on the brand name alone and score ~0 on the title gate.
+- Nykaa Fashion's `price` is the **pre-discount list price** and `discountedPrice` is what the
+  shopper pays (4895 / 2937 at a 40% discount on the verified sample). This is the same trap as
+  Nahdi's `shelf_price`, which once recorded a 254.00 product at 878.60.
+
+Both sites are fetched with **no browser and no ScrapeOps credits** — a plain GET through
+Webshare returns the fully populated blob, because it is server-rendered for the app to hydrate
+from.
 
 **Known gap:** Amazon UAE candidates missing a `brand` on the search grid are topped up by the
 `brandFallback` product-page fetch. That top-up depends on being able to load an Amazon product
@@ -183,8 +199,9 @@ cannot be the thing that gets blocked.
 | `helper/browserClient.js` (via `helper/scrapeClient.js`) | Amazon UAE, Firstcry UAE | Real headless Chrome. Only needed where a page's data is injected by its own JavaScript |
 
 A target picks between them with `scraper: "axios"` or `scraper: "puppeteer"`. This replaced the
-ScrapeOps and ScrapingAnt HTTP proxy APIs, removing the per-request credit cost and the
-dependency on a third party's rendering tier.
+ScrapeOps and ScrapingAnt HTTP proxy APIs as the *primary* path, removing the per-request credit
+cost and the dependency on a third party's rendering tier. ScrapeOps now sits behind both clients
+as a **fallback only** — see section 5.8.
 
 ### 5.0 Proxy credentials (deployment requirement)
 
@@ -346,13 +363,62 @@ The durable fix for a blocking target is the one applied to Nahdi in section 5.1
 endpoint the site's own storefront calls and read that instead. Firstcry UAE is the remaining
 candidate for the same treatment; it is still on one product page per candidate.
 
+### 5.8 Vendor order: Webshare first, ScrapeOps as fallback
+
+The main backend keeps its scraping vendors in a `scraping_vendors` table
+(`sellerpundit-backend/scraping/src/models/scrapingvendor.js` — `name`, `scraping_method`
+`"proxy" | "api"`, credentials, `status`). This service has no such table, so the same decision
+lives in **`config/scrapingVendors.js`** as plain config:
+
+```js
+const VENDOR_ORDER = ["webshare", "scrapeops"];
+```
+
+| Vendor | `scraping_method` | Role |
+|---|---|---|
+| `webshare` | `proxy` | **Primary for every target.** `config/proxy.js`, used by both fetch clients above. Far cheaper per page, and verified live against Nahdi, Myntra and Nykaa Fashion as answering 200 on a plain GET |
+| `scrapeops` | `api` | **Fallback only.** `helper/scrapeOpsClient.js`. Billed per request and slower, so it is tried only once Webshare has exhausted its own attempts on that URL |
+
+Both fetch paths hand off at the point they give up — `helper/httpClient.js` after its 3 rotated
+attempts, `helper/scrapeClient.js` after its 3 browser attempts — so **every** target gains the
+fallback without any per-target config. Two deliberate properties:
+
+- **404/410 never reach ScrapeOps.** `PermanentHttpError` means "this URL is gone", not "this IP
+  is unwelcome", so it fails fast rather than spending a paid request to be told the same thing.
+- **A missing key degrades to exactly the old behaviour.** `isConfigured()` is false, the
+  Webshare error is re-thrown verbatim, and nothing anywhere reports an auth problem. A failed
+  fetch should not become a confusing credentials error just because a fallback exists.
+
+When both vendors fail, the thrown error carries both reasons in one message (plus
+`.primaryError` / `.fallbackError`) — either one alone has sent someone looking in the wrong
+place before.
+
+#### ScrapeOps credentials (optional)
+
+Same posture as the proxy credentials: **no baked-in key**. Read in this order:
+
+1. Env var — `SCRAPEOPS_API_KEY`
+2. `config.json` — `SCRAPEOPS_Api_Key` (gitignored, where `SMTP_*` / `PROXY_*` already live)
+
+```json
+"SCRAPEOPS_Api_Key": "..."
+```
+
+This is **not** a deployment requirement — unlike the proxy credentials, leaving it unset is a
+supported configuration and simply disables the fallback. Set it to turn the fallback on; no code
+change is needed either way.
+
+Requests go to `https://proxy.scrapeops.io/v1/` with `premium=true` by default (the plain pool
+has effectively already been tried, since Webshare's own rotation failed before the hand-off) and
+`render_js` only where the caller asked for rendering.
+
 ---
 
 ## 6. API Surface
 
 | Endpoint | Status | Behavior |
 |---|---|---|
-| `POST /product-matching` | Legacy, unchanged | `{ brand: [skus...], projectId, target? }` — checks a specific SKU list against one target (defaults to Nahdi). Existing callers keep working exactly as before. |
+| `POST /product-matching` | Legacy, unchanged | `{ brand: [skus...], projectId, category?, destination? }` — checks a specific SKU list against one target. `destination` is one of `nahdi` (the default) \| `mumzworld` \| `myntra` \| `nykaafashion`; the parameter is named `destination`, not `target`, as an earlier revision of this table said. Existing callers keep working exactly as before. |
 | `POST /product-matching/brand` | New | `{ brandName, projectId }` — runs every target configured for that brand in `brandTargets.js`, pulls the brand's whole catalog automatically (no SKU list needed), combines results into one spreadsheet. |
 
 ---
@@ -363,10 +429,85 @@ candidate for the same treatment; it is still on one product page per candidate.
 `brand` + `projectId`. Fields used: `title`, `url`, `brand`, `sku`, `category`, `images`,
 `attributes`, `price`, `mrp`.
 
+`ScratchProducts` is **read-only** throughout this service — every access is a `findAll`.
+There is no `create` / `update` / `upsert` / `destroy` anywhere in the project, so nothing a run
+produces is written back into the shared catalog.
+
 **Output:** one `.xlsx` file per run (`helper/exportResults.js`), one row per source product,
 with columns: target, source title/brand/SKU/URL/price, whether matched, matched
 title/URL/price, and the four individual field scores. Emailed to the team alongside the
 raw JSON (matched + errors) as attachments.
+
+### 7.1 Local test store
+
+`testDestinations.js` additionally keeps every run in a **local** Postgres database —
+`database/localConfig.js` + `models/destinationTestResults.js`, one row per
+(run x destination x source product).
+
+This exists because a run costs a live fetch per product, and the per-run JSON files are
+islands: answering "what did Myntra return for this SKU last week, and has the price moved?"
+meant scraping it again. The row stores the **full** candidate list as `JSONB`, not just the
+three the console prints, so that question is a query:
+
+```sql
+select r."sourceSku", c->>'brand', c->>'title', (c->>'price')::numeric
+from "destinationTestResults" r, jsonb_array_elements(r.candidates) c
+where r.destination = 'Myntra' and r."runId" = '<run id>';
+```
+
+It also stores `query` and `brandWasPrefixed` — the output of the brand-in-title rule, which is
+a thing that gets changed, so a stored query is evidence of how the code behaved on that date.
+
+The run emails a spreadsheet (one sheet per destination) to `jaineel@mergekart.com`; `--to`
+redirects it and `--no-mail` skips it.
+
+### 7.2 Matched-product enrichment (`matchedDetail`)
+
+For the **matched product only** — one product page per source product, not per candidate — the
+run collects the fields that exist only on the product page. None of them are on the search
+listing, so there is no cheaper route; and at 50 candidates a page, doing it for all of them
+would be ~50x the cost for data that is discarded 49 times.
+
+| Destination | Fields |
+|---|---|
+| Myntra | url, rating, rating count, review count, title, brand, size, mrp, price, Product Details, Specifications |
+| Nykaa Fashion | url, rating, rating count, review count, title, brand, size, mrp, price, Product Details, and the brand figures: Years, Orders Fulfilled, Average Rating, Customer Ratings |
+
+Read from each page's own hydration blob (`window.__myx` → `pdpData` on Myntra;
+`details.skuData.product` on Nykaa Fashion). Four things that are not obvious:
+
+- **Nykaa's `hybridPDP.product.details` is empty** — the obvious-looking path is hydrated
+  client-side. The data is under `details.skuData.product`.
+- **Nykaa's size label is `sizeName`**, not `size_data`. `size_data` is category-specific
+  measurements — `eu_size`/`us_size` on footwear but bust/waist/inseam on apparel — so reading it
+  returned a blank size for every non-footwear product. A single-size product (a watch) has
+  `isOneSize: true` and no options at all, and is labelled "One Size".
+- **Nykaa's ratings come from `review_rating_json`, not the JSON-LD.** It omits
+  `aggregateRating` from the JSON-LD whenever `show_ratings` is false (a product with only a
+  couple of ratings), which left 7 of 10 products blank. The figures are present either way, so
+  they are read from the state and `ratingShown` records whether the site displays them.
+- **Myntra reports the raw mean** (`4.386759581881533`), rounded to 2dp here.
+
+`matchedBy` records how the product was chosen: `matching-service` (cleared all four gates) or
+`top-candidate` (scoring unavailable, first search result stood in). The enriched fields are only
+as trustworthy as that choice — a service match is a verdict, a top candidate is a guess — so the
+column travels with the data into both the sheet and the database. `--strict-match` disables the
+stand-in.
+
+Three deliberate properties:
+
+- **Separate database, separate Sequelize instance.** It shares no code with
+  `database/config.js`, which points at the shared `sellerpundit-live` host and calls
+  `sequelize.sync()` on require — requiring one never pulls in the other, so a local test
+  cannot issue schema statements against production.
+- **Created on first use.** `CREATE DATABASE` can't run against the database being created, so
+  `ensureDatabaseExists()` bootstraps via the `postgres` maintenance database with a raw client.
+  Defaults assume stock local Postgres with trust auth (user = `$USER`), so most dev machines
+  need no configuration; override with `LOCAL_DB_*` env vars or `LOCAL_DB_*` keys in
+  `config.json`.
+- **Strictly additive.** No local Postgres, a refused connection or a failed insert prints one
+  line and the run continues — the JSON file is written either way. `--no-store` skips it
+  entirely. Runs append; a second run never disturbs the first.
 
 ---
 

@@ -6,8 +6,9 @@ const express = require("express");
 const app = express();
 const sendUpdateReportEmail = require("./helper/sendUpdateReport.js");
 const { fetchHtml, closeFetchClients } = require("./helper/scrapeClient.js");
-const { fetchPage, fetchJson } = require("./helper/httpClient.js");
+const { fetchJson } = require("./helper/httpClient.js");
 const { exportResultsToExcel } = require("./helper/exportResults.js");
+const { withFetchableImages } = require("./helper/sourceImages.js");
 const timing = require("./helper/timingLogger.js");
 const targetSites = require("./config/targetSites.js");
 const brandTargets = require("./config/brandTargets.js");
@@ -333,6 +334,22 @@ async function buildCandidatesFromDetailPages(targetConfig, doc, query) {
     return candidates;
 }
 
+// What text to search a target with for a given source product. Most targets
+// search on the title alone, which is what this has always done; a target can
+// override it with `buildQuery` in config/targetSites.js — Myntra and Nykaa
+// Fashion both ask for brand + title, since their relevance ranking leans on
+// the brand token and our source titles don't always carry it.
+//
+// Centralised here (rather than at each call site) so the URL built for a
+// search, the candidates collected from it, and the line written to the timing
+// log can't disagree about what was actually searched for.
+function searchQueryFor(targetConfig, sourceProduct) {
+    if (typeof targetConfig.buildQuery === "function") {
+        return targetConfig.buildQuery(sourceProduct);
+    }
+    return sourceProduct.title;
+}
+
 // Fields the matching service validates as strings. One non-string value in
 // any of them gets the WHOLE request rejected with a 422 — seen with Nahdi's
 // JSON-LD `brand: {"@type":"Brand","name":null}` — so they're coerced here
@@ -404,7 +421,13 @@ async function callMatchingService(originalProduct, comparableProducts) {
             'X-API-Key': "test123#"
         },
         data: {
-            "original_product": withStringTextFields(originalProduct),
+            // withFetchableImages: ScratchProducts stores Google Drive SHARE
+            // links for some projects (verified on project 353), and those
+            // answer 200 with an HTML viewer page rather than an image — so
+            // image_similarity, one of the four gates, is computed against
+            // nothing. helper/sourceImages.js rewrites them to a directly
+            // fetchable form and drops folder links.
+            "original_product": withStringTextFields(withFetchableImages(originalProduct)),
             "comparable_products": comparableProducts.map(withStringTextFields),
             "include_image_similarity": true
         },
@@ -459,8 +482,12 @@ function pickBestMatch(matchData) {
 //   "mumzworld" -> Mumzworld's search API, which returns every candidate in
 //                  one request. Source rows are whatever the project holds,
 //                  e.g. Nahdi products scraped into ScratchProducts.
+//   "myntra" / "nykaafashion"
+//               -> one search page per source product, searched by brand +
+//                  title, with every candidate read off that page's own
+//                  hydration JSON. First page of results only.
 // ---------------------------------------------------------------------------
-const MATCHING_DESTINATIONS = ["nahdi", "mumzworld"];
+const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "myntra", "nykaafashion"];
 
 async function productMatching(brands, projectId, category, destination = "nahdi") {
     try {
@@ -495,7 +522,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             },
             // limit: 1,
             raw: true,
-            attributes: ['title', 'url', 'brand', 'sku', 'category', 'images', 'attributes', 'price', 'mrp']
+            attributes: ['title', 'url', 'brand', 'sku', 'asin', 'category', 'images', 'attributes', 'price', 'mrp']
         });
 
         const brand = sourceProducts[0].brand;
@@ -538,9 +565,12 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             // from this one request; a search-page destination (Nahdi)
             // returns HTML, turned into candidates below.
             const usesSearchApi = Boolean(targetConfig.searchApi);
-            const url = usesSearchApi ? null : targetConfig.buildSearchUrl(sourceProduct.title);
+            // Not necessarily sourceProduct.title — a target can ask for a
+            // composed query (brand + title) via buildQuery.
+            const searchQuery = searchQueryFor(targetConfig, sourceProduct);
+            const url = usesSearchApi ? null : targetConfig.buildSearchUrl(searchQuery);
 
-            console.log(x, sourceProduct.title, url || `(${targetConfig.label} search API)`);
+            console.log(x, searchQuery, url || `(${targetConfig.label} search API)`);
 
             let searchResult = null;
             try {
@@ -550,10 +580,16 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                 // escalate now; a retry gets a fresh browser context and
                 // therefore a fresh rotating exit IP instead.
                 searchResult = usesSearchApi
-                    ? await buildCandidatesFromSearchApi(targetConfig, sourceProduct.title)
+                    ? await buildCandidatesFromSearchApi(targetConfig, searchQuery)
                     : await timing.step(
                         `${targetConfig.label} search page fetch`,
-                        () => fetchPage(url),
+                        // Was a bare fetchPage(), which hardcoded the plain-GET
+                        // path regardless of what the target's config asked
+                        // for. Nahdi (scraper: "axios") is unaffected — that
+                        // IS the plain-GET path — but a destination needing a
+                        // browser would silently have been fetched without one
+                        // here, while the brand flow fetched it correctly.
+                        () => fetchHtml(targetConfig.scraper, url, targetConfig.scraperOptions),
                         { detail: url, summarize: describeHtml }
                     );
             } catch (err) {
@@ -594,7 +630,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                 try {
                     productBatches = await timing.step(
                         `${targetConfig.label} candidate collection`,
-                        () => buildCandidatesFromDoc(targetConfig, doc, sourceProduct.title),
+                        () => buildCandidatesFromDoc(targetConfig, doc, searchQuery),
                         { summarize: (c) => `${c.length} candidate(s)` }
                     );
                 } catch (error) {
@@ -794,7 +830,7 @@ async function runBrandMatching(brandName, projectId, skus = null) {
     const localCatalog = await ScratchProducts.findAll({
         where,
         raw: true,
-        attributes: ['title', 'url', 'brand', 'sku', 'category', 'images', 'attributes', 'price', 'mrp']
+        attributes: ['title', 'url', 'brand', 'sku', 'asin', 'category', 'images', 'attributes', 'price', 'mrp']
     });
 
     if (localCatalog.length === 0) {
@@ -833,7 +869,7 @@ async function runBrandMatching(brandName, projectId, skus = null) {
 
                 const candidates = await timing.step(
                     `${targetConfig.label} candidate collection`,
-                    () => buildCandidatesFromSearch(targetConfig, sourceProduct.title),
+                    () => buildCandidatesFromSearch(targetConfig, searchQueryFor(targetConfig, sourceProduct)),
                     { summarize: (c) => `${c.length} candidate(s)` }
                 );
                 if (candidates.length === 0) {

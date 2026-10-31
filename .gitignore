@@ -1,3 +1,13 @@
 node_modules
 config.json
 logs/
+
+# Per-run output files, all written to the working directory by index.js and
+# testDestinations.js. They carry a timestamp in the name, so without this
+# every run leaves a new untracked file behind.
+destination_test_*.json
+destination_test_*.xlsx
+products_matched_*.json
+products_matching_errors_*.json
+brand_matching_*.json
+brand_matching_*.xlsx

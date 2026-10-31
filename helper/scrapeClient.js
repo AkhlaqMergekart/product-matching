@@ -1,6 +1,8 @@
 const { fetchViaBrowser, closeBrowser } = require("./browserClient.js");
 const { fetchPage, closeSession } = require("./httpClient.js");
 const { logEvent } = require("./timingLogger.js");
+const { tryScrapeOpsFallback } = require("./scrapeOpsClient.js");
+const { scrapeOpsIsFallback } = require("../config/scrapingVendors.js");
 
 // Fetches `url` with whichever strategy `scraperType` names, retrying up to 3
 // times. Both strategies route every request through the Webshare proxy, so
@@ -51,6 +53,12 @@ async function fetchHtml(scraperType, url, options = {}) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     }
+  }
+
+  // Same vendor hand-off as the HTTP path: ScrapeOps renders JS itself, so a
+  // target that needed a browser is still served correctly through it.
+  if (scrapeOpsIsFallback()) {
+    return tryScrapeOpsFallback(url, { ...options, renderJs: options.renderJs !== false }, lastError);
   }
 
   throw lastError;

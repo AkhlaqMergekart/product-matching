@@ -17,12 +17,22 @@ const fileConfig = (() => {
 // an entry here, not touching the matching engine in index.js.
 //
 // `scraper` names the fetch strategy fetchHtml() (helper/scrapeClient.js)
-// uses to retrieve the page. Every target now uses "puppeteer" — a real
-// headless browser driven through the Webshare rotating proxy
-// (helper/browserClient.js) — having previously gone through the ScrapeOps
-// and ScrapingAnt HTTP proxy APIs. The field is kept because the fetch method
-// is genuinely part of a site's config, so a future target can opt into a
-// different one without touching the matching engine.
+// uses to retrieve the page, both of them routed through the Webshare
+// rotating proxy:
+//   "axios"     -> a plain GET with a real browser's headers on a sticky
+//                  proxy tunnel (helper/httpClient.js). ~1-5s a page, an
+//                  order of magnitude cheaper than a browser, and the
+//                  preferred option — Nahdi, Myntra and Nykaa Fashion all
+//                  serve everything the extractors need to it.
+//   "puppeteer" -> real headless Chrome (helper/browserClient.js). Needed
+//                  only where a page's data is injected by its own
+//                  JavaScript, or where the site won't serve a non-browser
+//                  client at all: Amazon UAE and Firstcry UAE.
+// The legacy names "scrapeops" / "scrapingant" are still accepted and map to
+// the browser, so an old config keeps working. ScrapeOps itself is no longer
+// a `scraper` value — it is now a vendor-level FALLBACK behind both
+// strategies (config/scrapingVendors.js, helper/scrapeOpsClient.js), so a
+// target does not opt into it.
 //
 // A target with `searchApi` skips everything below: its own search API
 // returns full candidates in one request, with no search page involved. Used
@@ -38,7 +48,10 @@ const fileConfig = (() => {
 // 2. `needsDetailFetch: false` -> build the full candidate object directly
 //    from the search-results page, no second request at all. Used for Amazon
 //    UAE, whose grid carries enough data to compare against and whose product
-//    pages carry a much higher block risk than reading the grid once.
+//    pages carry a much higher block risk than reading the grid once; and for
+//    Myntra and Nykaa Fashion, whose grids are rendered client-side but which
+//    ship the JSON their own app hydrates from in a <script> on that page —
+//    richer than the grid, and still one request.
 // 3. `needsDetailFetch: true` -> visit each candidate's own product page for
 //    full field data. One request per candidate, so it's the most expensive
 //    and most block-prone of the three; only Firstcry UAE still needs it,
@@ -80,6 +93,150 @@ function extractJsonLdProduct(doc) {
   }
 
   return null;
+}
+
+// Pulls a JSON object out of a `<script>` that assigns one to a global, e.g.
+// Myntra's `window.__myx = {...}`. Same reasoning as extractJsonLdProduct
+// above: the blob is what the site's own app hydrates from, so it is
+// server-rendered and maintained, where the grid it renders into is not in the
+// HTML at all.
+//
+// `prefix` must match the assignment including its `=`. Several scripts on a
+// page can share a global's name as a prefix (window.__myx vs
+// window.__myx_seo__), and matching loosely picks up the wrong one.
+//
+// Returns null rather than throwing when nothing matches or the blob is
+// malformed, so an extractor reports "no candidates" instead of aborting the
+// source product.
+function extractAssignedJson(doc, prefix) {
+  for (const script of xpath.select("//script", doc)) {
+    const text = script.textContent || "";
+    const match = text.match(prefix);
+    if (!match) continue;
+
+    // From the assignment's `{` to the end of the script, minus a trailing
+    // semicolon. These blobs are the whole body of their script tag.
+    const start = text.indexOf("{", match.index + match[0].length - 1);
+    if (start === -1) continue;
+
+    try {
+      return JSON.parse(text.slice(start).trim().replace(/;\s*$/, ""));
+    } catch (err) {
+      // Keep looking: on Myntra the first `window.__myx`-prefixed script is
+      // `window.__myx_deviceType__ = 'desktop'`, which is not an object at
+      // all. A strict `prefix` makes that rare, not impossible.
+      continue;
+    }
+  }
+
+  return null;
+}
+
+// Query text for a target that searches better on brand + title than on title
+// alone (see `buildQuery` in the Myntra / Nykaa Fashion entries). Prepends the
+// source product's brand unless its title already carries it, so a title like
+// "Nike Air Max SC SE" isn't searched as "Nike Nike Air Max SC SE".
+function composeBrandTitleQuery(product) {
+  const title = typeof product?.title === "string" ? product.title.trim() : "";
+  const brand = typeof product?.brand === "string" ? product.brand.trim() : "";
+  return prefixBrand(brand, title) || title || brand;
+}
+
+// Strips HTML to readable text. The storefronts ship these descriptions as
+// markup fragments ("<p>…<br>…</p>"), which is noise in a spreadsheet cell.
+function htmlToText(value) {
+  return String(value || "")
+    .replace(/<\s*br\s*\/?\s*>/gi, "\n")
+    .replace(/<\/\s*p\s*>/gi, "\n")
+    .replace(/<[^>]*>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// Pulls a labelled figure out of Nykaa Fashion's brand_book "horizontal
+// widget", whose items are {title: "3k+", subtitle: "Orders \nFulfilled"}.
+// Matched on the subtitle because the order of the four is not guaranteed, and
+// with whitespace collapsed because the subtitles carry embedded newlines.
+function brandBookFigure(items, pattern) {
+  const match = (items || []).find((item) => pattern.test(String(item?.subtitle || "").replace(/\s+/g, " ").trim()));
+  return match ? String(match.title || "").trim() : "";
+}
+
+// Query text as a URL path segment, for a site that puts the search terms in
+// the path (Myntra). Anything that isn't alphanumeric collapses to a single
+// hyphen, which is the form Myntra itself canonicalises to — and the reason
+// losing an apostrophe here is harmless is that the real query travels
+// alongside it in `rawQuery`.
+function slugify(query) {
+  return String(query || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+// Casefold, strip accents, drop everything that isn't a letter or digit. Used
+// only to decide whether two strings name the same brand — never to build text
+// that is sent anywhere.
+function normalizeBrandText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    // Combining marks, so "L'Oréal" and "Loreal" compare equal.
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+// Shared by the query builder and the two extractors: `brand` followed by
+// `text`, unless `text` already names that brand.
+//
+// "Already names it" is deliberately not a literal match. Catalogue rows
+// routinely write the brand one way in the `brand` column and another way in
+// the title, and an exact comparison treats those as different brands:
+//
+//   brand "Levis"         + title "Levi's 511 Slim Fit Jeans"
+//   brand "Levi's"        + title "Levis Men 511 Slim Fit Jeans"
+//   brand "L'Oréal Paris" + title "Loreal Paris Total Repair Shampoo"
+//   brand "M&S"           + title "M & S Cotton Shirt"
+//
+// Each of those would otherwise be searched as "Levis Levi's 511 Slim Fit
+// Jeans" — the brand token duplicated in a mangled form, which is worse for
+// relevance ranking than either spelling alone. So the comparison is made on
+// both strings stripped of case, accents and punctuation.
+function prefixBrand(brand, text) {
+  const name = (text || "").trim();
+  const brandName = (brand || "").trim();
+  if (!brandName) return name;
+  if (!name) return brandName;
+
+  const normBrand = normalizeBrandText(brandName);
+  const normName = normalizeBrandText(name);
+
+  if (!normBrand) return name;
+
+  // Stripping punctuation also strips word boundaries, so containment can
+  // over-match: brand "Gap" is found inside "Gapless Seamless Tee" and the
+  // prefix is skipped. That is the harmless direction to be wrong in — the
+  // query loses a brand token it would have gained, rather than gaining a
+  // mangled duplicate of one.
+  //
+  // Below 3 normalized characters the over-match stops being harmless (a
+  // 2-letter brand is a substring of a great many words), so those fall back
+  // to a strict word-boundary test on the original text. The cost is that a
+  // short punctuated brand still duplicates: brand "M&S" normalizes to "ms",
+  // so "M&S" + "M & S Cotton Shirt" is searched as "M&S M & S Cotton Shirt".
+  // No brand in the current projects is affected.
+  if (normBrand.length >= 3) {
+    return normName.includes(normBrand) ? name : `${brandName} ${name}`;
+  }
+
+  const escaped = brandName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|\\W)${escaped}($|\\W)`, "i").test(name) ? name : `${brandName} ${name}`;
 }
 
 const targetSites = {
@@ -494,6 +651,482 @@ const targetSites = {
     },
   },
 
+  // -------------------------------------------------------------------------
+  // Myntra and Nykaa Fashion are both Mode C (needsDetailFetch: false), but
+  // not in the way Amazon UAE is: their search grids are rendered client-side,
+  // so there is nothing for an xpath selector to read. What they DO ship,
+  // server-rendered in a <script> on the search page, is the exact JSON their
+  // own React app hydrates from — which carries more per product than a card
+  // ever shows (full gallery, brand, MRP vs selling price, category path).
+  //
+  // So the extractors below read that blob rather than the DOM. Both verified
+  // live 2026-10-31 through the Webshare proxy on a plain GET (no browser, no
+  // ScrapeOps needed): Myntra 706 KB / 50 products, Nykaa Fashion 860 KB / 36
+  // products, for a `brand + title` query.
+  //
+  // First page only, per the brief — and that is what these blobs contain. No
+  // pagination: Myntra exposes `searchData.nextPaginationContext` and Nykaa
+  // `listingV2.currentPage`, both deliberately unused.
+  // -------------------------------------------------------------------------
+  myntra: {
+    id: "myntra",
+    label: "Myntra",
+    scraper: "axios",
+    needsDetailFetch: false,
+
+    // Searched by brand + title rather than title alone. Myntra's relevance
+    // ranking leans heavily on the brand token, and our source titles don't
+    // always carry it.
+    buildQuery: composeBrandTitleQuery,
+
+    // Myntra's search URL puts the query in the PATH as a slug and repeats it
+    // in `rawQuery`. The slug is what the site canonicalises to; rawQuery is
+    // what it actually searches on, which is why an apostrophe or a stray
+    // symbol lost to slugification costs nothing.
+    buildSearchUrl: (query) =>
+      `https://www.myntra.com/${slugify(query) || "search"}?rawQuery=${encodeURIComponent(query)}`,
+
+    extractListingProducts: (doc) => {
+      // Three scripts on the page start with `window.__myx` — the state blob
+      // plus `window.__myx_deviceType__` and `window.__myx_seo__`. The `=`
+      // with nothing between it and the name is what distinguishes the one we
+      // want; matching on the prefix alone picks up `'desktop'` and fails.
+      const state = extractAssignedJson(doc, /window\.__myx\s*=\s*/);
+      const products = state?.searchData?.results?.products;
+      if (!Array.isArray(products)) return [];
+
+      return products
+        .map((item) => {
+          // landingPageUrl is relative with no leading slash
+          // ("sports-shoes/nike/nike-air-max-sc-se-womens-shoes/46384606/buy").
+          const url = item.landingPageUrl
+            ? `https://www.myntra.com/${String(item.landingPageUrl).replace(/^\//, "")}`
+            : item.productId
+              ? `https://www.myntra.com/${item.productId}`
+              : "";
+
+          // masterCategory > subCategory > articleType, e.g.
+          // "Footwear > Shoes > Sports Shoes". `category` on its own is just
+          // the leaf, so build the path the other targets supply.
+          const category = [item.masterCategory?.typeName, item.subCategory?.typeName, item.articleType?.typeName]
+            .filter((part) => part && String(part).trim())
+            .join(" > ") || item.category || "";
+
+          // The gallery carries a "size_representation" view whose src is ""
+          // (a size chart, not the product), so filter on the value rather
+          // than trusting every entry.
+          const images = (Array.isArray(item.images) ? item.images : [])
+            .map((img) => img?.src)
+            .filter((src) => typeof src === "string" && src.trim());
+
+          const brand = typeof item.brand === "string" ? item.brand.trim() : "";
+          // Myntra's productName already leads with the brand ("Nike Air Max
+          // SC SE Women's Shoes"), unlike Amazon's split cards — so prefix
+          // only when it genuinely isn't there.
+          const title = prefixBrand(brand, item.productName || item.product || "");
+
+          const price = round2(item.price);
+          const mrp = round2(item.mrp) || price;
+
+          return {
+            url,
+            category,
+            brand,
+            title,
+            sku: String(item.productId || ""),
+            price,
+            mrp,
+            totalRating: item.rating ? String(item.rating) : "",
+            totalReview: item.ratingCount ? String(item.ratingCount) : "",
+            express: false,
+            description: typeof item.additionalInfo === "string" ? item.additionalInfo.trim() : "",
+            images,
+          };
+        })
+        .filter((p) => p.url);
+    },
+
+    // Fetched for the MATCHED product only — one extra page per source
+    // product, not per candidate. These fields are not on the search listing
+    // at all (the blob there has no ratings, sizes, description or
+    // attributes), so there is no way to get them without the product page,
+    // and no reason to pay for it 50 times when 49 are discarded.
+    //
+    // Reads pdpData out of the product page's own `window.__myx`, the same
+    // mechanism as the listing. Verified live 2026-10-31 against
+    // /sports-shoes/nike/nike-air-max-sc-se-womens-shoes/46384606/buy.
+    matchedDetail: {
+      buildUrl: (candidate) => candidate.url,
+
+      extract: (doc, url) => {
+        const state = extractAssignedJson(doc, /window\.__myx\s*=\s*/);
+        const pd = state?.pdpData;
+        if (!pd) return { url, error: "no pdpData on the product page" };
+
+        const ratings = pd.ratings || {};
+
+        // Sizes carry an `available` flag, and an out-of-stock size is not a
+        // size you can buy — so both lists are kept rather than collapsing
+        // them, which would misreport availability either way.
+        const allSizes = (Array.isArray(pd.sizes) ? pd.sizes : []).map((s) => String(s.label || "").trim()).filter(Boolean);
+        const inStockSizes = (Array.isArray(pd.sizes) ? pd.sizes : [])
+          .filter((s) => s.available)
+          .map((s) => String(s.label || "").trim())
+          .filter(Boolean);
+
+        // productDetails is a list of titled sections, matching the page's own
+        // headings: "Product Details" (the prose the shopper reads first),
+        // "MATERIAL & CARE", "SIZE & FIT". The description is the first; the
+        // others are kept under `sections` rather than thrown away, since they
+        // cost nothing once the page is fetched.
+        const sections = Array.isArray(pd.productDetails) ? pd.productDetails : [];
+        const mainDetail = sections.find((s) => /^product details$/i.test(String(s.title || "").trim()));
+
+        return {
+          url,
+          // Myntra's own product id, the same value the search listing yields
+          // as `sku`. Carried here too so the enriched row stands alone.
+          sku: String(pd.id || ""),
+          title: pd.name || "",
+          brand: (typeof pd.brand === "string" ? pd.brand : pd.brand?.name) || "",
+          // Rounded: Myntra reports the raw mean (4.386759581881533), which is
+          // noise in a spreadsheet cell.
+          rating: ratings.averageRating != null ? String(round2(ratings.averageRating)) : "",
+          ratingCount: ratings.totalCount != null ? String(ratings.totalCount) : "",
+          reviewCount: ratings.reviewInfo?.reviewsCount != null ? String(ratings.reviewInfo.reviewsCount) : "",
+          size: inStockSizes.join(", "),
+          sizesAll: allSizes.join(", "),
+
+          // Per-size pricing. The headline mrp/price below is the parent's,
+          // which need not be what the size we actually hold costs: each size
+          // carries its own sizeSellerData, and a size can be listed by more
+          // than one seller at different prices (size 6 of style 27953916 was
+          // offered at both 2399 and 5999 on 2026-10-31). The lowest is taken,
+          // which is the one the storefront shows.
+          variants: (Array.isArray(pd.sizes) ? pd.sizes : []).map((s) => {
+            const sellers = Array.isArray(s.sizeSellerData) ? s.sizeSellerData : [];
+            const prices = sellers.map((d) => round2(d.discountedPrice)).filter((n) => n > 0);
+            const mrps = sellers.map((d) => round2(d.mrp)).filter((n) => n > 0);
+            return {
+              size: String(s.label || "").trim(),
+              available: Boolean(s.available),
+              sku: s.skuId != null ? String(s.skuId) : "",
+              price: prices.length ? Math.min(...prices) : round2(pd.price?.discounted),
+              mrp: mrps.length ? Math.min(...mrps) : round2(pd.mrp),
+            };
+          }),
+
+          // Myntra puts every COLOUR on its own styleId and its own URL, each
+          // with its own price — which is what "the price changes when the
+          // colour changes" means here. They are sibling products, not options
+          // on this page, so reading a different colour's price means fetching
+          // that colour's page.
+          baseColour: pd.baseColour || "",
+          colourOptions: (Array.isArray(pd.colours) ? pd.colours : []).map((c) => ({
+            label: String(c.label || "").trim(),
+            styleId: c.styleId != null ? String(c.styleId) : "",
+            url: c.url ? `https://www.myntra.com/${String(c.url).replace(/^\//, "")}` : "",
+          })),
+          mrp: round2(pd.mrp ?? pd.price?.mrp),
+          price: round2(pd.price?.discounted ?? pd.mrp),
+          // The page's "PRODUCT DETAILS" prose. Both forms are kept: the
+          // source markup exactly as the site ships it, and a readable
+          // plain-text rendering. Which one is wanted depends on the consumer
+          // — a spreadsheet cell needs the text, anything re-rendering the
+          // copy needs the original markup — and the HTML cannot be
+          // reconstructed from the text once it has been stripped.
+          description: htmlToText(mainDetail?.description || ""),
+          descriptionHtml: mainDetail?.description || "",
+          // The "Specifications" table on the page, as JSON. A flat
+          // label -> value map ("Sole Material": "PU", "Sport": "Running").
+          specifications: pd.articleAttributes && typeof pd.articleAttributes === "object" ? pd.articleAttributes : {},
+          sections: sections.map((s) => ({ title: s.title || "", html: s.description || "", text: htmlToText(s.description || "") })),
+        };
+      },
+    },
+  },
+
+  nykaafashion: {
+    id: "nykaafashion",
+    label: "Nykaa Fashion",
+    scraper: "axios",
+    needsDetailFetch: false,
+
+    buildQuery: composeBrandTitleQuery,
+
+    buildSearchUrl: (query) =>
+      `https://www.nykaafashion.com/catalogsearch/result/?q=${encodeURIComponent(query)}`,
+
+    extractListingProducts: (doc) => {
+      // A <script id="__PRELOADED_STATE__" type="application/json">, so the
+      // whole element text is the JSON — no assignment prefix to strip.
+      const script = xpath.select("//script[@id='__PRELOADED_STATE__']", doc)?.[0];
+      if (!script) return [];
+
+      let state;
+      try {
+        state = JSON.parse(script.textContent);
+      } catch (err) {
+        return [];
+      }
+
+      const listing = state?.listingV2;
+      const products = listing?.products;
+      if (!Array.isArray(products)) return [];
+
+      // Nykaa Fashion NEVER returns an empty result set. Verified live
+      // 2026-10-31: a deliberate nonsense query ("zzzzqqq nonexistent product
+      // xyz") still answers with products, `isNotFound: false` and a non-zero
+      // `count` — it just substitutes whatever it considers closest.
+      //
+      // The one honest signal it gives is `uiMessage`, which it sets to
+      // "No results found for '<query>'. Showing most relevant results." in
+      // exactly that case. Treating those as candidates would spend a full
+      // matching-service request (~2.5s for the first call on a product) to
+      // score items the site has already said are not results.
+      //
+      // This only catches the site's own admission. A query it thinks it
+      // answered but didn't — "Loreal Paris Total Repair 5 Shampoo" returns
+      // bath towels and soap dispensers on a fashion site, with an empty
+      // uiMessage and count: 153 — is not detectable here, and is left to the
+      // title/brand gates, which score such candidates near 0.
+      if (typeof listing.uiMessage === "string" && /^no results found/i.test(listing.uiMessage.trim())) {
+        return [];
+      }
+
+      return products
+        .map((item) => {
+          // Nykaa splits the name across two fields, and NOT the way the
+          // names suggest: `title` is the brand ("Nike") and `subTitle` is the
+          // product ("Men's Downshifter 14 Running Shoes"). Taking `title` as
+          // the title — the obvious reading — would compare every candidate on
+          // the brand name alone and score ~0 on the title gate.
+          const brand = typeof item.title === "string" ? item.title.trim() : "";
+          const name = typeof item.subTitle === "string" ? item.subTitle.trim() : "";
+          const title = prefixBrand(brand, name) || brand;
+
+          // `price` is the pre-discount list price and `discountedPrice` is
+          // what the shopper pays (4895 / 2937 at a 40% discount on the
+          // verified sample) — the reverse of the field names' first reading,
+          // and the same trap Nahdi's shelf_price was.
+          const price = round2(item.discountedPrice) || round2(item.price);
+          const mrp = round2(item.price) || price;
+
+          // Full gallery in display order, from the PDP bridge the card
+          // carries; imageUrl is just its first entry.
+          const gallery = (Array.isArray(item.plp_pdp_bridge?.images) ? item.plp_pdp_bridge.images : [])
+            .slice()
+            .sort((a, b) => (parseInt(a?.position, 10) || 0) - (parseInt(b?.position, 10) || 0))
+            .map((img) => img?.url)
+            .filter((url) => typeof url === "string" && url.trim());
+
+          const images = gallery.length > 0 ? gallery : item.imageUrl ? [item.imageUrl] : [];
+
+          return {
+            url: item.actionUrl ? `https://www.nykaafashion.com${String(item.actionUrl).replace(/^\/?/, "/")}` : "",
+            // `categoryId` is a bare list of numeric ids with no names
+            // anywhere on the page, so there is no category path to give here.
+            // It was never a match gate.
+            category: "",
+            brand,
+            title,
+            sku: String(item.sku || item.id || ""),
+            price,
+            mrp,
+            totalRating: "",
+            totalReview: "",
+            express: false,
+            description: "",
+            images,
+          };
+        })
+        .filter((p) => p.url);
+    },
+
+    // Matched product only, same rationale as Myntra's above.
+    //
+    // Two sources on one page, because neither alone is complete:
+    //   - `details.skuData.product` in __PRELOADED_STATE__ carries sizes,
+    //     prices, the Product details widget and the brand_book figures.
+    //   - the schema.org Product block carries the ratings, which the state
+    //     does not (`review_rating_json` is {} on every sample seen).
+    //
+    // Note `hybridPDP.product.details` looks like the obvious place and is
+    // empty — Nykaa hydrates that client-side. The data is under `details`,
+    // not `hybridPDP`. Verified live 2026-10-31 against
+    // /nike-downshifter-14-men-s-road-running-shoe/p/26355138.
+    //
+    // Its REST API is not an option here: every /rest/appapi/ path probed
+    // answered 403/404/400 through the proxy, so the page is the way in.
+    matchedDetail: {
+      buildUrl: (candidate) => candidate.url,
+
+      extract: (doc, url) => {
+        const script = xpath.select("//script[@id='__PRELOADED_STATE__']", doc)?.[0];
+        let product = null;
+        if (script) {
+          try {
+            product = JSON.parse(script.textContent)?.details?.skuData?.product || null;
+          } catch (err) {
+            product = null;
+          }
+        }
+
+        const ld = extractJsonLdProduct(doc) || {};
+        const rating = ld.aggregateRating || {};
+
+        if (!product) {
+          // The ratings block alone is still worth returning — better a row
+          // with the fields we could read than an empty one.
+          return {
+            url,
+            error: "no skuData on the product page",
+            title: ld.name || "",
+            brand: typeof ld.brand === "string" ? ld.brand : ld.brand?.name || "",
+            rating: rating.ratingValue != null ? String(rating.ratingValue) : "",
+            ratingCount: rating.ratingCount != null ? String(rating.ratingCount) : "",
+            reviewCount: rating.reviewCount != null ? String(rating.reviewCount) : "",
+          };
+        }
+
+        // Same brand/name split as the listing: `title` is the brand.
+        const brand = typeof product.title === "string" ? product.title.trim() : "";
+        const name = typeof product.subTitle === "string" ? product.subTitle.trim() : "";
+
+        // `sizeName` is the display label the shopper picks, and it is the
+        // only size field that works across categories: "XS, S, M, L" for a
+        // shirt, "32, 34, 36" for a kurta, "UK 6 (EU 40)" for a shoe.
+        //
+        // `size_data` is NOT a substitute — it is category-specific
+        // measurements (eu_size/us_size on footwear, but bust/waist/inseam on
+        // apparel), so reading it was why every non-footwear product came back
+        // with a blank size. It is kept only as a fallback for an option that
+        // somehow has no sizeName.
+        //
+        // A single-size product (a watch) has isOneSize: true and NO options
+        // at all, which is a real answer rather than a gap, so it is labelled
+        // instead of left blank.
+        const options = Array.isArray(product.sizeOptions?.options) ? product.sizeOptions.options : [];
+        const sizeLabels = options
+          .map((opt) => {
+            const name = String(opt.sizeName || "").trim();
+            if (name) return name;
+            const eu = opt.size_data?.eu_size?.cm;
+            const us = opt.size_data?.us_size?.cm;
+            if (eu && us) return `EU ${eu} (US ${us})`;
+            return eu ? `EU ${eu}` : us ? `US ${us}` : "";
+          })
+          .filter(Boolean);
+
+        if (sizeLabels.length === 0 && product.isOneSize) {
+          sizeLabels.push("One Size");
+        }
+
+        // The "Product details" widget holds a label/value attribute table
+        // plus free-text children ("Care instructions", "Pack contains").
+        //
+        // pdp_sections normally hangs off each size option (identical across
+        // sizes, so the first is taken), but a ONE-SIZE product — a watch, a
+        // bag — has no options at all and carries them on the product
+        // instead. Reading only options[0] left every such product with no
+        // description and no specifications: 3 of 10 in the 2026-10-31 run.
+        const sections = Array.isArray(options[0]?.pdp_sections)
+          ? options[0].pdp_sections
+          : Array.isArray(product.pdp_sections)
+            ? product.pdp_sections
+            : [];
+        const detailWidget = sections.find((s) => /^product details$/i.test(String(s.title || "").trim()));
+        const children = Array.isArray(detailWidget?.child_widgets) ? detailWidget.child_widgets : [];
+
+        const attributes = {};
+        for (const child of children) {
+          for (const attr of Array.isArray(child.attributes) ? child.attributes : []) {
+            if (attr?.label) attributes[String(attr.label)] = String(attr.value ?? "");
+          }
+          // plain_widget children are a titled single value.
+          if (child?.widget_type === "plain_widget" && child.title) {
+            attributes[String(child.title)] = htmlToText(child.value || "");
+          }
+        }
+
+        // The prose description. On Nykaa this is NOT the "Product details"
+        // widget — that one is the attribute grid (Material, Pattern,
+        // Occasion…), i.e. the specifications. The description lives in the
+        // separate "Know your product" collapsible, whose subtitle is
+        // literally ["Description"].
+        //
+        // Its `value` is sometimes plain text ("PRODUCT STORY: Step up your
+        // sneaker game…") and sometimes a full HTML fragment
+        // ("<div>…<h3>Benefits</h3><ul>…"), varying by brand feed — so both
+        // forms are kept, exactly as for Myntra.
+        const kyp = sections.find((s) => /know your product/i.test(String(s.title || "").trim()));
+        const descriptionHtml = kyp?.value || "";
+
+        const bookItems = (Array.isArray(product.brand_book) ? product.brand_book : [])
+          .find((w) => w?.widget_type === "horizontal_widget")?.items || [];
+
+        // Ratings come from `review_rating_json` first, NOT the JSON-LD.
+        // Nykaa omits aggregateRating from the JSON-LD whenever
+        // `show_ratings` is false — which it sets for a product with only a
+        // couple of ratings — so the JSON-LD alone left 7 of 10 products in
+        // the 2026-10-31 run blank. The figures are present either way
+        // (star_rating 2.5 / star_rating_count 2 on one such product), and the
+        // site's own number is worth having even where the site chooses not
+        // to show it. `ratingShown` records that choice so a hidden rating is
+        // not mistaken for a displayed one.
+        const rr = product.review_rating_json && typeof product.review_rating_json === "object" ? product.review_rating_json : {};
+        const ratingValue = rr.star_rating ?? rating.ratingValue;
+        const ratingCount = rr.star_rating_count ?? rating.ratingCount;
+        const reviewCount = rr.review_count ?? rating.reviewCount;
+
+        return {
+          url,
+          // Nykaa's own SKU ("NIKEX00086194"), matching the listing's.
+          sku: String(product.sku || product.id || ""),
+          title: prefixBrand(brand, name) || ld.name || brand,
+          brand,
+          rating: ratingValue != null ? String(round2(ratingValue)) : "",
+          ratingCount: ratingCount != null ? String(ratingCount) : "",
+          reviewCount: reviewCount != null ? String(reviewCount) : "",
+          ratingShown: rr.show_ratings === undefined ? "" : String(Boolean(rr.show_ratings)),
+          size: sizeLabels.join(", "),
+
+          // Per-size pricing, same reasoning as Myntra's. Nykaa carries it
+          // directly on each size option, so no extra fetch is involved.
+          variants: options.map((opt) => ({
+            size: String(opt.sizeName || "").trim(),
+            available: !opt.isOutOfStock,
+            sku: String(opt.sku || opt.id || ""),
+            price: round2(opt.discountedPrice) || round2(opt.price),
+            mrp: round2(opt.price),
+          })),
+
+          // Colour siblings, each its own product with its own action_url.
+          colourOptions: (Array.isArray(product.colorOptions) ? product.colorOptions : []).map((c) => ({
+            label: String(c?.color?.name || c?.name || c?.title || "").trim(),
+            sku: String(c?.sku || c?.id || ""),
+            url: c?.actionUrl || c?.action_url ? `https://www.nykaafashion.com${String(c.actionUrl || c.action_url).replace(/^\/?/, "/")}` : "",
+          })),
+          // `price` is the list price and `discountedPrice` what is charged —
+          // the same inversion as the listing.
+          mrp: round2(product.price),
+          price: round2(product.discountedPrice) || round2(product.price),
+          description: htmlToText(descriptionHtml),
+          descriptionHtml,
+          // Same field name and shape as Myntra's, so one consumer reads both
+          // destinations. This is the "Product details" attribute grid the
+          // page renders — Material, Pattern, Occasion, Care instructions…
+          specifications: attributes,
+          // The four brand-trust figures shown on the PDP.
+          brandYears: brandBookFigure(bookItems, /^years/i),
+          brandOrdersFulfilled: brandBookFigure(bookItems, /orders fulfilled/i),
+          brandAverageRating: brandBookFigure(bookItems, /average rating/i),
+          brandCustomerRatings: brandBookFigure(bookItems, /customer ratings/i),
+        };
+      },
+    },
+  },
+
   mumzworld: {
     id: "mumzworld",
     label: "Mumzworld",
@@ -613,4 +1246,21 @@ function mumzworldImages(hit) {
   return hit.image_url ? [hit.image_url] : [];
 }
 
+// True when two brand strings name the same brand, comparing with case,
+// accents and punctuation stripped — so "Levis"/"Levi's" and "L'Oréal"/
+// "Loreal" match. Same normalisation prefixBrand() uses.
+//
+// Exported because callers outside this file need the same test: a candidate
+// whose brand is not the source product's brand cannot be the same product,
+// and that is checkable without the matching service.
+function brandsMatch(a, b) {
+  const x = normalizeBrandText(a);
+  const y = normalizeBrandText(b);
+  if (!x || !y) return false;
+  // Containment rather than equality, both ways: marketplaces append or drop
+  // qualifiers ("Adidas" vs "Adidas Originals", "Stag" vs "Stag Iconic").
+  return x === y || x.includes(y) || y.includes(x);
+}
+
 module.exports = targetSites;
+module.exports.brandsMatch = brandsMatch;
