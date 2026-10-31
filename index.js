@@ -9,6 +9,7 @@ const { fetchHtml, closeFetchClients } = require("./helper/scrapeClient.js");
 const { fetchJson } = require("./helper/httpClient.js");
 const { exportResultsToExcel } = require("./helper/exportResults.js");
 const { withFetchableImages } = require("./helper/sourceImages.js");
+const { saveHtml } = require("./helper/htmlCache.js");
 const timing = require("./helper/timingLogger.js");
 const targetSites = require("./config/targetSites.js");
 const brandTargets = require("./config/brandTargets.js");
@@ -36,18 +37,59 @@ const ScratchProducts = require("./models/scratchProducts.js");
 // scores, which it already returns and which the old rule ignored entirely.
 // Gating on it keeps the signal from title/image/price/model instead of
 // discarding a candidate for one weak term.
-const BRAND_MATCH_THRESHOLD = 0.85;
+// 0.30, not 0.85. The service scores brand by STRING SIMILARITY, not brand
+// identity, so a partial name scores low even when it is the same brand —
+// measured against the live service on 2026-11-01:
+//   Stag Iconic vs STAG             -> 0.533
+//   Adidas      vs Adidas Originals -> 0.545
+//   HEAD        vs Head             -> 1.000
+//   Babolat     vs NIVIA            -> 0.167  (genuinely unrelated)
+// At 0.85 the first two were rejected outright however well title and images
+// matched. 0.30 keeps unrelated brands out while admitting partial names.
+// Replaying the 597-product reference run, 0.85 -> 0.30 admitted ZERO extra
+// candidates, because composite_score already weights brand — so this only
+// recovers matches that the hard gate was discarding, it does not loosen.
+const BRAND_MATCH_THRESHOLD = 0.30;
 const COMPOSITE_MATCH_THRESHOLD = 0.70;
 
+// Secondary path. A candidate whose composite falls just short can still be a
+// match when the TITLE and the IMAGE both agree strongly — marketplaces rename
+// products ("Trousers" -> "Track Pants"), which drags the composite down even
+// though it is plainly the same item.
+//
+// Title is required on purpose. The rejected alternative — "any 2 of
+// (composite, brand, image) >= 0.80" — skips title, and since brand is 1.00
+// for every same-brand candidate and image >= 0.80 for any two products in
+// similar packaging, it reduces to "same brand, looks like the brand".
+// Replayed over the 597-product reference run it matched Solgar Vitamin B12
+// to Solgar Vitamin D3 (comp 0.60, brand 1.00, img 0.90), plus Biotin, D3
+// 400 IU, D3 10000 IU and others onto that same listing.
+//
+// Measured on that run: this rule takes 17.1% -> 23.5% of products matched
+// (+38) with no false positives observed, where the rejected one gave 41.4%
+// with roughly one in four wrong.
+const RESCUE_TITLE_THRESHOLD = 0.75;
+const RESCUE_IMAGE_THRESHOLD = 0.70;
+const RESCUE_BRAND_THRESHOLD = 0.80;
+
 // Used by BOTH flows below, so the legacy SKU-list path and the brand path
-// cannot drift apart on what counts as a match — they previously applied the
-// same rule from two separate copies.
+// cannot drift apart on what counts as a match.
 function clearsMatchThreshold(entry) {
     const fieldScores = entry && entry.field_scores;
     if (!fieldScores) return false;
 
-    return fieldScores.brand >= BRAND_MATCH_THRESHOLD
-        && entry.composite_score >= COMPOSITE_MATCH_THRESHOLD;
+    if (fieldScores.brand >= BRAND_MATCH_THRESHOLD
+        && entry.composite_score >= COMPOSITE_MATCH_THRESHOLD) {
+        return true;
+    }
+
+    // Note: image_similarity is only computed for the candidates that reach
+    // the image pass (IMAGE_SCORING_TOP_N), so this path can only rescue
+    // candidates already in the top N by text score — which is the right
+    // population anyway.
+    return (fieldScores.title || 0) >= RESCUE_TITLE_THRESHOLD
+        && (fieldScores.image_similarity || 0) >= RESCUE_IMAGE_THRESHOLD
+        && (fieldScores.brand || 0) >= RESCUE_BRAND_THRESHOLD;
 }
 const MATCHING_SERVICE_URL = "http://localhost:8000/api/match";
 
@@ -90,6 +132,31 @@ function appendToFile(filename, data) {
             });
         });
     });
+}
+
+// Append-only, per-product ledger. One line per source product the moment it
+// finishes, whatever the outcome — so an interrupted run can be resumed from
+// the exact SKU it stopped on, rather than from the start of the chunk.
+//
+// Written with appendFileSync (O_APPEND, one small line) rather than the
+// read-modify-write appendToFile() used for the JSON outputs: a crash
+// mid-write can truncate those, and the ledger is the thing that has to
+// survive exactly the crash it is there to recover from.
+//
+// JSONL, not JSON, for the same reason — no closing bracket to corrupt.
+function recordProgress(projectId, destination, sku, outcome, extra) {
+    try {
+        const line = JSON.stringify(Object.assign({
+            at: new Date().toISOString(),
+            projectId: projectId,
+            destination: destination,
+            sku: String(sku),
+            outcome: outcome
+        }, extra || {}));
+        fs.appendFileSync(`progress_${projectId}_${destination}.jsonl`, line + "\n", "utf8");
+    } catch (err) {
+        console.error("recordProgress failed for", sku, "-", err.message);
+    }
 }
 
 function delay(ms) {
@@ -439,11 +506,17 @@ function matchingServiceError(err, candidates) {
 // the first call for a product (~2.5s; each later call ~0.06s, per the
 // Beesline project 349 timing logs of 2026-10-12), so the extra round trips
 // bought nothing.
-async function callMatchingService(originalProduct, comparableProducts) {
-    originalProduct.price = originalProduct.price ? parseFloat(originalProduct.price) : 0;
-    originalProduct.mrp = originalProduct.mrp ? parseFloat(originalProduct.mrp) : 0;
+// How many candidates get the expensive image pass. The service scores text
+// in ~1.3s for a whole page but ~9s PER CANDIDATE once images are on, so
+// image-scoring all 50 is ~99% of a run's wall time. Measured 2026-10-31:
+// concurrency does not help (1/2/4/8 workers all ~0.07 cand/s — the box is
+// CPU-saturated by TensorFlow), so the only lever is comparing fewer.
+// The eventual match was inside the top 5 by text score on every run checked.
+// 0 disables the two-pass and scores everything, as before.
+const IMAGE_SCORING_TOP_N = parseInt(process.env.IMAGE_SCORING_TOP_N || "10", 10);
 
-    const config = {
+function buildMatchRequest(originalProduct, comparableProducts, includeImages) {
+    return {
         method: 'post',
         maxBodyLength: Infinity,
         url: MATCHING_SERVICE_URL,
@@ -458,31 +531,125 @@ async function callMatchingService(originalProduct, comparableProducts) {
         },
         data: {
             // withFetchableImages: ScratchProducts stores Google Drive SHARE
-            // links for some projects (verified on project 353), and those
-            // answer 200 with an HTML viewer page rather than an image — so
-            // image_similarity, one of the four gates, is computed against
-            // nothing. helper/sourceImages.js rewrites them to a directly
-            // fetchable form and drops folder links.
+            // links, which answer 200 with an HTML viewer page rather than an
+            // image. helper/sourceImages.js rewrites them to a fetchable form.
             "original_product": withStringTextFields(withFetchableImages(originalProduct)),
             "comparable_products": comparableProducts.map(withStringTextFields),
-            "include_image_similarity": true
+            "include_image_similarity": includeImages
         },
-        // 120s was enough while image_similarity was silently scoring 0 (the
-        // source images were unfetchable Drive share links, so the service had
-        // nothing to download). With real images it does one TensorFlow
-        // inference per image pair — ~0.5s, and a 50-candidate page against 5
-        // source images is ~250 pairs — which overran 120s and failed the
-        // whole product with "timeout of 120000ms exceeded".
         timeout: parseInt(process.env.MATCHING_SERVICE_TIMEOUT_MS || "600000", 10)
     };
+}
 
-    const matchResponse = await timing.step(
-        "Product matching",
-        () => axios.request(config).catch((err) => { throw matchingServiceError(err, comparableProducts); }),
-        { detail: `${comparableProducts.length} candidate(s) in one request` }
+async function requestMatch(originalProduct, comparableProducts, includeImages, label) {
+    const response = await timing.step(
+        label,
+        () => axios.request(buildMatchRequest(originalProduct, comparableProducts, includeImages))
+            .catch((err) => { throw matchingServiceError(err, comparableProducts); }),
+        { detail: `${comparableProducts.length} candidate(s)` }
+    );
+    return Array.isArray(response.data) ? response.data : [];
+}
+
+// Fetches the MATCHED product's own page and pulls the fields that only exist
+// there — images, description, specifications, rating and total ratings, plus
+// Nykaa Fashion's brand figures (Years on Nykaa, Orders Fulfilled, Average
+// Rating, Customer Ratings).
+//
+// This is needed because the matching service strips `images` to [] and
+// returns no description or specifications, so the matched product as scored
+// carries almost none of the detail worth reporting.
+//
+// One page per MATCHED product — not per candidate — so it adds a single
+// fetch to a run that found something, and nothing at all to a run that did
+// not. The raw HTML is cached (helper/htmlCache.js) so further fields can be
+// pulled later without re-fetching.
+async function enrichMatchedProduct(targetConfig, matchedProduct, sourceSku) {
+    const cfg = targetConfig.matchedDetail;
+    if (!cfg) return null;
+
+    const url = cfg.buildUrl(matchedProduct);
+    if (!url) return null;
+
+    try {
+        const html = await timing.step(
+            `${targetConfig.label} matched product page fetch`,
+            () => fetchHtml(targetConfig.scraper, url, targetConfig.scraperOptions),
+            { detail: url, summarize: describeHtml }
+        );
+
+        const htmlFile = saveHtml(targetConfig.id, sourceSku, "matched-product", url, html);
+
+        const $ = cheerio.load(html);
+        const detail = cfg.extract(new dom().parseFromString($.xml(), "text/xml"), url);
+
+        if (htmlFile) detail.htmlFile = htmlFile;
+        return detail;
+    } catch (err) {
+        // A failed enrichment costs only the extra fields; the match itself is
+        // already decided and written.
+        console.error(`Could not enrich matched product ${url}:`, err.message);
+        return { url, error: err.message };
+    }
+}
+
+// Two passes: score every candidate on text alone (cheap), then re-score only
+// the strongest handful with images (expensive). Returns the full candidate
+// list either way, so nothing downstream sees a shorter set — the tail simply
+// keeps its text-only scores.
+async function callMatchingService(originalProduct, comparableProducts) {
+    originalProduct.price = originalProduct.price ? parseFloat(originalProduct.price) : 0;
+    originalProduct.mrp = originalProduct.mrp ? parseFloat(originalProduct.mrp) : 0;
+
+    if (IMAGE_SCORING_TOP_N <= 0 || comparableProducts.length <= IMAGE_SCORING_TOP_N) {
+        return requestMatch(originalProduct, comparableProducts, true, "Product matching");
+    }
+
+    const textScored = await requestMatch(
+        originalProduct, comparableProducts, false, "Product matching pass 1 (text only)"
+    );
+    if (textScored.length === 0) return textScored;
+
+    // Only candidates that already clear the BRAND gate can ever be a match
+    // (clearsMatchThreshold requires brand >= BRAND_MATCH_THRESHOLD), so
+    // image-scoring the rest cannot change any outcome — it just costs ~8s
+    // each. Pass 1 is ~0.02s for a whole page, which makes this filter free.
+    //
+    // When nothing clears the brand gate the image pass is skipped entirely:
+    // that is the common case for a catalogue like project 353, where the
+    // destination often does not stock the brand at all and the search returns
+    // unrelated substitutes rather than nothing.
+    const brandOk = textScored.filter(
+        (e) => e.field_scores && e.field_scores.brand >= BRAND_MATCH_THRESHOLD
     );
 
-    return matchResponse.data;
+    if (brandOk.length === 0) {
+        timing.logEvent(`No candidate clears the brand gate — skipping the image pass (${textScored.length} candidate(s) scored on text only)`);
+        return textScored;
+    }
+
+    // The service returns candidates sorted by composite_score descending.
+    const top = brandOk.slice(0, IMAGE_SCORING_TOP_N);
+    const topSkus = new Set(top.map((e) => String(e.product && e.product.sku)));
+    const rest = textScored.filter((e) => !topSkus.has(String(e.product && e.product.sku)));
+
+    // Re-send the ORIGINAL candidate objects, not the ones the service echoed
+    // back: its response strips `images` to [], so feeding those into the
+    // image pass would compare against nothing and score 0 for every one.
+    const bySku = new Map(comparableProducts.map((p) => [String(p.sku), p]));
+    const topOriginals = top
+        .map((e) => bySku.get(String(e.product && e.product.sku)))
+        .filter(Boolean);
+
+    if (topOriginals.length === 0) return textScored;
+
+    const imageScored = await requestMatch(
+        originalProduct, topOriginals, true, `Product matching pass 2 (images, top ${topOriginals.length} of ${brandOk.length} brand-matching)`
+    );
+
+    // Image scores change the composite, so re-sort the merged list — the
+    // callers take the FIRST candidate that clears, assuming best-first order.
+    return imageScored.concat(rest).sort((a, b) => (b.composite_score || 0) - (a.composite_score || 0));
 }
 
 // Applies the "all four scores >= 0.85" rule (unchanged threshold) and
@@ -633,6 +800,11 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                         () => fetchHtml(targetConfig.scraper, url, targetConfig.scraperOptions),
                         { detail: url, summarize: describeHtml }
                     );
+
+                // Search pages are cached only when HTML_CACHE_SEARCH=1 — at
+                // ~720 KB each they would be ~4 GB for a full two-destination
+                // run, where the matched product pages are a few MB.
+                saveHtml(targetConfig.id, sourceProduct.sku, "search", url, searchResult);
             } catch (err) {
                 console.error("Error navigating to URL:", err);
                 retryCount++;
@@ -642,6 +814,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                         sourceProduct: sourceProduct,
                         error: "Max retries reached"
                     });
+                    recordProgress(projectId, destination, sourceProduct.sku, "error", { error: "Max retries reached" });
                     continue; // Skip to the next source product
                 } else {
                     x = x - 1; // Decrement x to retry the current source product
@@ -693,6 +866,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                     sourceProduct: sourceProduct,
                     error: "No products found"
                 });
+                recordProgress(projectId, destination, sourceProduct.sku, "no-candidates", {});
                 continue; // Skip to the next source product if no products found
             }
 
@@ -719,6 +893,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                     sourceProduct: sourceProduct,
                     error: "No match data found"
                 });
+                recordProgress(projectId, destination, sourceProduct.sku, "no-match-data", {});
                 continue; // Skip to the next source product if no match data found
             }
 
@@ -730,6 +905,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             });
 
             let foundProductCount = 0;
+            let matchedEntry = null;
             try {
 
                 // The service returns candidates already sorted by
@@ -738,9 +914,15 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                 for (var i = 0; i < matchData.length; i++) {
 
                     if (clearsMatchThreshold(matchData[i])) {
+                        matchedEntry = matchData[i];
+                        const matchedDetail = await enrichMatchedProduct(
+                            targetConfig, matchData[i].product, sourceProduct.sku
+                        );
+
                         const finalObj = {
                             sourceProduct: sourceProduct,
                             matchedProducts: matchData[i],
+                            matchedDetail: matchedDetail,
                         };
 
                         await appendToFile(outputFilePath, finalObj);
@@ -763,6 +945,17 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             }
 
             timing.logEvent(foundProductCount === 0 ? "Result: no candidate cleared the match threshold" : "Result: match found");
+
+            recordProgress(
+                projectId, destination, sourceProduct.sku,
+                foundProductCount === 0 ? "no-match" : "matched",
+                foundProductCount === 0 ? { candidates: productBatches.length } : {
+                    candidates: productBatches.length,
+                    matchedTitle: (matchedEntry && matchedEntry.product && matchedEntry.product.title) || "",
+                    matchedUrl: (matchedEntry && matchedEntry.product && matchedEntry.product.url) || "",
+                    composite: matchedEntry ? matchedEntry.composite_score : null
+                }
+            );
 
             if (foundProductCount === 0) {
                 console.log("No matching products found for:", sourceProduct.title);

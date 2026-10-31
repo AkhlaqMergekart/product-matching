@@ -11,3 +11,10 @@ products_matched_*.json
 products_matching_errors_*.json
 brand_matching_*.json
 brand_matching_*.xlsx
+
+# Run artefacts produced by run-project.sh / the per-product ledger
+progress_*.jsonl
+run_*.progress
+run_*.log
+html_cache/
+nohup.out

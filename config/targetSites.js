@@ -795,6 +795,15 @@ const targetSites = {
           ratingCount: ratings.totalCount != null ? String(ratings.totalCount) : "",
           reviewCount: ratings.reviewInfo?.reviewsCount != null ? String(ratings.reviewInfo.reviewsCount) : "",
           size: inStockSizes.join(", "),
+
+          // Full gallery from the PDP, in album order. src/secureSrc carry
+          // Myntra's ($height)/($width) placeholders, so imageURL — the plain,
+          // directly fetchable form — is preferred, and any residual
+          // placeholder URL is dropped rather than handed on unusable.
+          images: (Array.isArray(pd.media && pd.media.albums) ? pd.media.albums : [])
+            .flatMap((a) => (Array.isArray(a.images) ? a.images : []))
+            .map((img) => img.imageURL || img.secureSrc || img.src)
+            .filter((u) => typeof u === "string" && u.length > 0 && u.indexOf("($") === -1),
           sizesAll: allSizes.join(", "),
 
           // Per-size pricing. The headline mrp/price below is the parent's,
@@ -1090,6 +1099,14 @@ const targetSites = {
           reviewCount: reviewCount != null ? String(reviewCount) : "",
           ratingShown: rr.show_ratings === undefined ? "" : String(Boolean(rr.show_ratings)),
           size: sizeLabels.join(", "),
+
+          // Full gallery from the PDP. The matching service strips `images`
+          // to [] in its response, so this is the only place the matched
+          // product's pictures come back.
+          images: (Array.isArray(product.productMedia) ? product.productMedia : [])
+            .filter((m) => m && m.mediaType === "image" && m.url)
+            .sort((a, b) => (parseInt(a.position, 10) || 0) - (parseInt(b.position, 10) || 0))
+            .map((m) => m.url),
 
           // Per-size pricing, same reasoning as Myntra's. Nykaa carries it
           // directly on each size option, so no extra fetch is involved.
