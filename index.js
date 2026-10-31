@@ -21,6 +21,12 @@ const MATCH_THRESHOLD = 0.85;
 const MATCH_FIELD_KEYS = ["title", "brand", "color", "image_similarity"];
 const MATCHING_SERVICE_URL = "http://localhost:8000/api/match";
 
+// Where every run report goes. Was five separate hardcoded addresses across
+// this file (four akhlaq@, one anushidh@), so changing the recipient meant
+// finding all five and missing one. Overridable with REPORT_EMAIL in the
+// environment.
+const REPORT_EMAIL = process.env.REPORT_EMAIL || "jaineel@mergekart.com";
+
 function appendToFile(filename, data) {
     // Read the file
     return new Promise((resolve, reject) => {
@@ -755,7 +761,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
         const mailOptions = {
             from: config.FROM_EMAIL,
-            to: "akhlaq@mergekart.com",
+            to: REPORT_EMAIL,
             subject: `Product Matching Report for ${brand} - ${projectId} (${targetConfig.label})`,
             text: `Product matching against ${targetConfig.label} completed successfully for brand: ${brand} and projectId: ${projectId}. Total matched products: ${allProducts.length}`,
             attachments: [
@@ -801,7 +807,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
         timing.endRun(`aborted: ${err.message}`);
         const mailOptions = {
             from: config.FROM_EMAIL,
-            to: "akhlaq@mergekart.com",
+            to: REPORT_EMAIL,
             subject: `Product Matching Error for ${brands.join(", ")} - ${projectId} (${destination})`,
             text: `An error occurred during product matching against ${destination} for brand: ${brands.join(", ")} and projectId: ${projectId}. Error: ${err.message}`,
         };
@@ -951,7 +957,7 @@ async function runBrandMatching(brandName, projectId, skus = null) {
 
     const mailOptions = {
         from: config.FROM_EMAIL,
-        to: "akhlaq@mergekart.com",
+        to: REPORT_EMAIL,
         subject: `Product Matching Report for ${brandName} - ${projectId}`,
         text: `Multi-marketplace product matching completed for brand: ${brandName}, project: ${projectId}. ${matchedCount}/${allResults.length} rows matched. See attached spreadsheet.`,
         attachments: [
@@ -999,7 +1005,7 @@ app.post('/product-matching', async (req, res) => {
 
         const mailOptions = {
             from: config.FROM_EMAIL,
-            to: "akhlaq@mergekart.com",
+            to: REPORT_EMAIL,
             subject: `Product Matching Error for ${brand} - ${projectId}`,
             text: `An error occurred during product matching for brand: ${brand} and projectId: ${projectId}. Error: ${error.message}`,
         };
@@ -1037,7 +1043,7 @@ app.post('/product-matching/brand', async (req, res) => {
 
         const mailOptions = {
             from: config.FROM_EMAIL,
-            to: "anushidh@mergekart.com",
+            to: REPORT_EMAIL,
             subject: `Product Matching Error for ${brandName} - ${projectId}`,
             text: `An error occurred during brand product matching for brand: ${brandName} and projectId: ${projectId}. Error: ${error.message}`,
         };
