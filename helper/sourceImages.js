@@ -13,9 +13,15 @@
 // the difference between a real score and a meaningless one — and it fails
 // silently, because a 200 with a body looks like success.
 //
-// The thumbnail form is preferred over uc?export=download: same picture, about
-// a third of the bytes, and it does not go through Drive's download
-// interstitial for larger files.
+// The URL has to be QUERY-FREE. Both /thumbnail?id=…&sz=… and
+// /uc?export=download&id=… carry their id in the query string, and the image
+// service truncates there — its log shows the attempt as
+// "Unexpected error downloading https://drive.google.com/thumbnail:" with the
+// parameters gone, so every comparison scored 0.0 (run of 2026-10-31).
+//
+// lh3.googleusercontent.com/d/<ID>=w1000 is Drive's own image CDN, puts the id
+// in the PATH, and answers 200 image/png — verified for the same file at both
+// 1000px (424 KB) and full size (1008 KB).
 //
 // Some entries are FOLDER links (/drive/folders/<ID>), which are not images at
 // all and are dropped — on SKU 175626 that was images[0], i.e. the first and
@@ -54,7 +60,7 @@ function normalizeImageUrl(value) {
   const id = driveFileId(url);
   if (!id) return null;
 
-  return `https://drive.google.com/thumbnail?id=${id}&sz=w${DRIVE_THUMBNAIL_WIDTH}`;
+  return `https://lh3.googleusercontent.com/d/${id}=w${DRIVE_THUMBNAIL_WIDTH}`;
 }
 
 // Maps a product's image list, dropping what cannot be fetched and de-duping
