@@ -17,8 +17,38 @@ require("./database/config.js");
 
 const ScratchProducts = require("./models/scratchProducts.js");
 
-const MATCH_THRESHOLD = 0.85;
-const MATCH_FIELD_KEYS = ["title", "brand", "color", "image_similarity"];
+// Match policy: the brand must be right, and the service's own weighted score
+// must be high enough.
+//
+// This replaces an AND of four independent 0.85 gates (title, brand, color,
+// image_similarity), which was near-unsatisfiable in practice:
+//
+//   - `color` scored exactly 0 on 85.6% of candidates — 1605 of 11133 in the
+//     597-product reference run — because neither the scraped candidates nor
+//     the source rows carry a colour the service can compare. That one term
+//     rejected most matches on its own.
+//   - Across those same 11133 scored candidates, exactly ONE cleared all four.
+//   - On SKU 175626 the per-gate maxima were title 0.848, brand 1.000,
+//     color 0.000, image 0.860 — so the conjunction could never be true, and
+//     title missed by 0.002 even ignoring colour.
+//
+// `composite_score` is the service's weighted combination of all seven field
+// scores, which it already returns and which the old rule ignored entirely.
+// Gating on it keeps the signal from title/image/price/model instead of
+// discarding a candidate for one weak term.
+const BRAND_MATCH_THRESHOLD = 0.85;
+const COMPOSITE_MATCH_THRESHOLD = 0.70;
+
+// Used by BOTH flows below, so the legacy SKU-list path and the brand path
+// cannot drift apart on what counts as a match — they previously applied the
+// same rule from two separate copies.
+function clearsMatchThreshold(entry) {
+    const fieldScores = entry && entry.field_scores;
+    if (!fieldScores) return false;
+
+    return fieldScores.brand >= BRAND_MATCH_THRESHOLD
+        && entry.composite_score >= COMPOSITE_MATCH_THRESHOLD;
+}
 const MATCHING_SERVICE_URL = "http://localhost:8000/api/match";
 
 // Where every run report goes. Was five separate hardcoded addresses across
@@ -460,9 +490,8 @@ async function callMatchingService(originalProduct, comparableProducts) {
 function pickBestMatch(matchData) {
     for (let i = 0; i < matchData.length; i++) {
         const fieldScores = matchData[i].field_scores;
-        const clearsThreshold = fieldScores && MATCH_FIELD_KEYS.every((key) => fieldScores[key] >= MATCH_THRESHOLD);
 
-        if (clearsThreshold) {
+        if (clearsMatchThreshold(matchData[i])) {
             // Unwrap to the product itself. The matching service returns each
             // candidate inside a score envelope —
             //   { product: {...}, composite_score, field_scores, ... }
@@ -703,11 +732,12 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             let foundProductCount = 0;
             try {
 
+                // The service returns candidates already sorted by
+                // composite_score descending (verified against a live run),
+                // so the first that clears is also the best that clears.
                 for (var i = 0; i < matchData.length; i++) {
 
-                    const fieldScores = matchData[i].field_scores;
-
-                    if (fieldScores && fieldScores.title >= 0.85 && fieldScores.brand >= 0.85 && fieldScores.color >= 0.85 && fieldScores.image_similarity >= 0.85) {
+                    if (clearsMatchThreshold(matchData[i])) {
                         const finalObj = {
                             sourceProduct: sourceProduct,
                             matchedProducts: matchData[i],
