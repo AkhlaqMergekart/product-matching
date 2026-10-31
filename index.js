@@ -431,7 +431,13 @@ async function callMatchingService(originalProduct, comparableProducts) {
             "comparable_products": comparableProducts.map(withStringTextFields),
             "include_image_similarity": true
         },
-        timeout: 120000
+        // 120s was enough while image_similarity was silently scoring 0 (the
+        // source images were unfetchable Drive share links, so the service had
+        // nothing to download). With real images it does one TensorFlow
+        // inference per image pair — ~0.5s, and a 50-candidate page against 5
+        // source images is ~250 pairs — which overran 120s and failed the
+        // whole product with "timeout of 120000ms exceeded".
+        timeout: parseInt(process.env.MATCHING_SERVICE_TIMEOUT_MS || "600000", 10)
     };
 
     const matchResponse = await timing.step(
