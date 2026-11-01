@@ -514,12 +514,14 @@ async function productMatching(brands, projectId, category, destination = "nahdi
         let retryCount = 0;
         let lastProcessedIndex = -1;
 
-        const outputFilePath = `products_matched_final_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
-        const errorFilePath = `products_matching_errors_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
-        const matchedFilePath = `products_matched_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${Date.now()}.json`;
+        // The destination is in every name: runs against different
+        // marketplaces (e.g. one pm2 process each) share this folder.
+        const outputFilePath = `products_matched_final_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${destination}_${Date.now()}.json`;
+        const errorFilePath = `products_matching_errors_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${destination}_${Date.now()}.json`;
+        const matchedFilePath = `products_matched_${sourceProducts[0].brand.replace(/\s+/g, "_")}_${projectId}_${destination}_${Date.now()}.json`;
         const emptyFilePath = `emptyFile.json`
         const timingFilePath = timing.startRun(
-            timing.timingLogPath(`${sourceProducts[0].brand}_${projectId}_${Date.now()}`),
+            timing.timingLogPath(`${sourceProducts[0].brand}_${projectId}_${destination}_${Date.now()}`),
             `${targetConfig.label} matching for brand ${brand}, project ${projectId}, ${sourceProducts.length} SKU(s)`
         );
 
@@ -1018,8 +1020,12 @@ app.get("/test", async (req, res) => {
     return res.status(200).json({ message: "API is working fine." });
 });
 
-const server = app.listen(8010, () => {
-    console.log("Server is running on port 8010");
+// PORT lets several processes run side by side (see ecosystem.config.js);
+// 8010 stays the default for the existing single-process setup.
+const PORT = Number(process.env.PORT) || 8010;
+
+const server = app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
 });
 
 // Both fetch clients hold something open for the life of the process — the
