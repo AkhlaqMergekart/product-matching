@@ -10,6 +10,7 @@ const { fetchPage, fetchJson } = require("./helper/httpClient.js");
 const { exportResultsToExcel } = require("./helper/exportResults.js");
 const timing = require("./helper/timingLogger.js");
 const { buildSearchQuery } = require("./helper/searchQuery.js");
+const { toDirectImageUrls } = require("./helper/imageUrls.js");
 const targetSites = require("./config/targetSites.js");
 const brandTargets = require("./config/brandTargets.js");
 
@@ -363,6 +364,15 @@ function withStringTextFields(product) {
     return copy;
 }
 
+// The request-body copy of a product: string text fields, and image URLs the
+// service can download (Google Drive share links turned into direct image
+// addresses — see helper/imageUrls.js). The stored product is not changed.
+function prepareForMatching(product) {
+    const copy = withStringTextFields(product);
+    if (copy.images != null) copy.images = toDirectImageUrls(copy.images);
+    return copy;
+}
+
 // Rewraps an axios failure so its message carries the service's own reason —
 // FastAPI's 422 `detail` says which field of which candidate it rejected,
 // which "Request failed with status code 422" does not. That message is what
@@ -406,8 +416,8 @@ async function callMatchingService(originalProduct, comparableProducts) {
             'X-API-Key': "test123#"
         },
         data: {
-            "original_product": withStringTextFields(originalProduct),
-            "comparable_products": comparableProducts.map(withStringTextFields),
+            "original_product": prepareForMatching(originalProduct),
+            "comparable_products": comparableProducts.map(prepareForMatching),
             "include_image_similarity": true
         },
         timeout: 120000
