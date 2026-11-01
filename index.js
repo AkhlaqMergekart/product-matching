@@ -1024,7 +1024,15 @@ app.get("/test", async (req, res) => {
 // 8010 stays the default for the existing single-process setup.
 const PORT = Number(process.env.PORT) || 8010;
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, (error) => {
+    // Express 5 calls this with the error when the port can't be bound (e.g.
+    // EADDRINUSE). Ignoring it used to print "Server is running" anyway, and
+    // the process then exited quietly once Postgres's idle connection closed
+    // ~10s later — a silent restart loop under pm2.
+    if (error) {
+        console.error(`Cannot listen on port ${PORT}: ${error.code || error.message}`);
+        process.exit(1);
+    }
     console.log(`Server is running on port ${PORT}`);
 });
 

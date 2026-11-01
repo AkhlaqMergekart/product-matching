@@ -14,7 +14,7 @@ module.exports = {
       name: "product-matching-amazon",
       script: "index.js",
       cwd: __dirname,
-      env: { PORT: 8011 },
+      env: { PORT: 8013 }, // not 8011: nginx listens there on the server
     },
     {
       name: "product-matching-flipkart",
