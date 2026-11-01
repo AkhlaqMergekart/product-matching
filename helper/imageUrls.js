@@ -4,10 +4,14 @@
 // Some catalogues store Google Drive *share* links ("drive.google.com/file/
 // d/<id>/view?usp=sharing" — project 353's Stag Iconic products). Those
 // answer with Drive's viewer page (text/html), so the service has no image to
-// compare and image similarity scores 0 for every candidate. For a publicly
-// shared file, Drive's thumbnail endpoint answers with the image (verified
-// 2026-11-01: the share link for TTRA 670 returned 85 KB of HTML, the
-// thumbnail URL the 43 KB JPEG).
+// compare and image similarity scores 0 for every candidate.
+//
+// For a publicly shared file, lh3.googleusercontent.com/d/<id> answers with
+// the image itself (HTTP 200 image/jpeg). It has to be that host: the
+// matching service does not follow redirects, and Drive's own image
+// addresses (drive.google.com/thumbnail?id=..., uc?export=view) answer 302/303
+// pointing here — sending the thumbnail address still scored 0 against a
+// candidate an ordinary .jpg scored 1.0 with (TTRA 670, 2026-11-01).
 //
 // Folder links ("drive.google.com/drive/folders/<id>") point at no single
 // image and can't be converted; they are left as they are.
@@ -44,7 +48,7 @@ function driveFileId(url) {
 function toDirectImageUrl(url) {
   if (typeof url !== "string") return url;
   const id = driveFileId(url.trim());
-  return id ? `https://drive.google.com/thumbnail?id=${id}&sz=w${DRIVE_IMAGE_WIDTH}` : url;
+  return id ? `https://lh3.googleusercontent.com/d/${id}=w${DRIVE_IMAGE_WIDTH}` : url;
 }
 
 // Maps a product's `images` (an array of URLs, or a single URL) to direct
