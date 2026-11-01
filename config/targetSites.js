@@ -1,5 +1,9 @@
 const path = require("path");
 const xpath = require("xpath");
+const { fetchJson } = require("../helper/httpClient.js");
+const { logEvent } = require("../helper/timingLogger.js");
+const spApi = require("../helper/spApiClient.js");
+const { searchFlipkart } = require("../helper/flipkartClient.js");
 
 // config.json is the repo's home for deploy-time overrides (see
 // config/proxy.js); a missing file just means "use the defaults".
@@ -24,9 +28,11 @@ const fileConfig = (() => {
 // is genuinely part of a site's config, so a future target can opt into a
 // different one without touching the matching engine.
 //
-// A target with `searchApi` skips everything below: its own search API
-// returns full candidates in one request, with no search page involved. Used
-// for Mumzworld (its Algolia index).
+// A target with `searchApi` skips everything below: an API answers the search
+// with full candidate data, with no search page involved. Used for Mumzworld
+// (its Algolia index), Amazon India (SP-API catalog search) and Flipkart (its
+// mobile site's search + serviceability APIs). Each exposes search(query) and
+// mapHit(result); buildCandidatesFromSearchApi() in index.js calls them.
 //
 // Otherwise there are three ways a target can turn one search page into full
 // candidate objects. buildCandidatesFromSearch() in index.js checks them in
@@ -543,6 +549,13 @@ const targetSites = {
       },
       extractHits: (response) => (Array.isArray(response?.hits) ? response.hits : []),
 
+      // Every searchApi target exposes search(query) -> raw results and
+      // mapHit(result) -> candidate; buildCandidatesFromSearchApi() in
+      // index.js does the rest.
+      async search(query) {
+        return this.extractHits(await fetchJson(this.buildUrl(query), { headers: this.headers() }));
+      },
+
       // Same candidate shape as Nahdi's extractDetail, so the matching
       // service sees no difference between destinations.
       mapHit(hit) {
@@ -570,7 +583,168 @@ const targetSites = {
       },
     },
   },
+
+  // Amazon India through the Selling Partner API's catalog search
+  // (helper/spApiClient.js) — keyword search on the source title, every
+  // field from the same response. Not to be confused with amazonAE above,
+  // which reads amazon.ae's search pages.
+  amazon: {
+    id: "amazon",
+    label: "Amazon India",
+    searchApi: {
+      host: "https://sellingpartnerapi-eu.amazon.com", // India is in SP-API's EU region
+      marketplaceId: "A21TJRUUN4KGV", // amazon.in
+      includedData: ["summaries", "attributes", "images", "classifications", "dimensions"],
+      pageSize: 20, // the API's maximum, and the same candidate count as Nahdi/Mumzworld
+
+      // Fails the run at its start, rather than every product failing the
+      // same way, when there are no credentials at all.
+      checkReady() {
+        if (!spApi.hasCredentials()) {
+          throw new Error("Amazon SP-API credentials are not configured (see helper/spApiClient.js).");
+        }
+      },
+
+      // Results without images are dropped: image similarity is one of the
+      // four match gates, so a candidate with no image can never match.
+      async search(query) {
+        const items = await spApi.searchCatalogItems({
+          host: this.host,
+          marketplaceId: this.marketplaceId,
+          keywords: query,
+          includedData: this.includedData,
+          pageSize: this.pageSize,
+        });
+        const withImages = items.filter((item) => amazonImages(item).length > 0);
+        if (withImages.length < items.length) {
+          logEvent(`Amazon India: ${items.length - withImages.length} of ${items.length} result(s) skipped for having no images`);
+        }
+        return withImages;
+      },
+
+      mapHit(item) {
+        const summary = item.summaries?.find((s) => s.marketplaceId === this.marketplaceId) || item.summaries?.[0] || {};
+        const attributes = item.attributes || {};
+        const { price, mrp } = amazonPrices(attributes);
+
+        return {
+          url: `https://www.amazon.in/dp/${item.asin}`,
+          category: summary.browseClassification?.displayName || summary.websiteDisplayGroupName || "",
+          brand: summary.brand || attributeValue(attributes, "brand") || "",
+          title: summary.itemName || attributeValue(attributes, "item_name") || "",
+          sku: String(item.asin || ""),
+          price,
+          mrp,
+          totalRating: "",
+          totalReview: "",
+          express: false,
+          description: amazonDescription(attributes),
+          images: amazonImages(item),
+        };
+      },
+    },
+  },
+
+  // Flipkart through its mobile site's search and serviceability APIs
+  // (helper/flipkartClient.js): one search for the pids, one serviceability
+  // call for title, brand, price, MRP and images.
+  flipkart: {
+    id: "flipkart",
+    label: "Flipkart",
+    searchApi: {
+      // A Flipkart search page holds 10-12 products; serviceability batches
+      // them all in one call.
+      maxResults: 20,
+
+      search(query) {
+        return searchFlipkart(query, this.maxResults);
+      },
+
+      mapHit({ pid, url, product }) {
+        const titles = product.titles || {};
+        const pricing = product.listingSummary?.pricing;
+        const priceOf = (type) => pricing?.prices?.find((p) => p.priceType === type)?.value;
+        // FSP is the selling price; an undiscounted listing has no MRP entry,
+        // so its MRP is the selling price.
+        const price = round2(priceOf("FSP") ?? pricing?.finalPrice?.value);
+        const mrp = round2(priceOf("MRP")) || price;
+
+        return {
+          url,
+          category: "",
+          brand: titles.superTitle || "",
+          title: titles.subtitle ? `${titles.title} (${titles.subtitle})` : titles.title || "",
+          sku: pid,
+          price,
+          mrp,
+          totalRating: product.rating?.average != null ? String(product.rating.average) : "",
+          totalReview: product.rating?.reviewCount != null ? String(product.rating.reviewCount) : "",
+          express: false,
+          // Neither API carries a description.
+          description: "",
+          images: flipkartImages(product),
+        };
+      },
+    },
+  },
 };
+
+// First value of an SP-API attribute (attributes come as arrays of
+// { value, language_tag, marketplace_id }).
+function attributeValue(attributes, name) {
+  const entry = attributes?.[name]?.[0];
+  return entry?.value != null ? String(entry.value) : "";
+}
+
+// The catalog API has no selling price of its own; some items carry a list
+// price, an MRP or (for our own listings) an offer in their attributes.
+// Missing prices stay 0 — price is not one of the match gates.
+function amazonPrices(attributes) {
+  const scheduled = (entries) => entries?.[0]?.schedule?.[0]?.value_with_tax;
+  const offer = attributes.purchasable_offer?.[0];
+  const listPrice = round2(attributes.list_price?.[0]?.value_with_tax ?? attributes.list_price?.[0]?.value);
+  const declaredMrp = round2(attributes.maximum_retail_price?.[0]?.value ?? scheduled(offer?.maximum_retail_price));
+
+  const price = round2(scheduled(offer?.our_price)) || listPrice || declaredMrp;
+  return { price, mrp: declaredMrp || listPrice || price };
+}
+
+// The product description when there is one, else the bullet points — the
+// part of a listing that reads like one. HTML tags (some descriptions carry
+// <br>, <b>, ...) are stripped.
+function amazonDescription(attributes) {
+  const text =
+    attributeValue(attributes, "product_description") ||
+    attributeValue(attributes, "short_product_description") ||
+    (attributes.bullet_point || []).map((b) => b?.value).filter(Boolean).join(" ");
+  return text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// One image per variant (MAIN, PT01, PT02, ...), MAIN first: the API lists
+// each variant at several sizes, of which the largest is kept.
+function amazonImages(item) {
+  const entries = (item.images || []).find((set) => set.marketplaceId === "A21TJRUUN4KGV")?.images || item.images?.[0]?.images || [];
+  const largest = new Map();
+  for (const image of entries) {
+    if (!image?.link) continue;
+    const best = largest.get(image.variant);
+    if (!best || (image.width || 0) * (image.height || 0) > (best.width || 0) * (best.height || 0)) {
+      largest.set(image.variant, image);
+    }
+  }
+  return [...largest.entries()]
+    .sort(([a], [b]) => (a === "MAIN" ? -1 : b === "MAIN" ? 1 : a.localeCompare(b)))
+    .map(([, image]) => image.link);
+}
+
+// Flipkart image URLs are templates ({@width}/{@height}, q={@quality}).
+// 832x832 at quality 70 is the size its product pages request.
+function flipkartImages(product) {
+  return (product.media?.images || [])
+    .map((image) => image?.url)
+    .filter(Boolean)
+    .map((url) => url.replace("{@width}", "832").replace("{@height}", "832").replace("{@quality}", "70"));
+}
 
 // Prices in the index carry float noise (28.9996 for a 29.00 shelf price).
 function round2(value) {

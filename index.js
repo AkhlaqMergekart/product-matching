@@ -9,6 +9,7 @@ const { fetchHtml, closeFetchClients } = require("./helper/scrapeClient.js");
 const { fetchPage, fetchJson } = require("./helper/httpClient.js");
 const { exportResultsToExcel } = require("./helper/exportResults.js");
 const timing = require("./helper/timingLogger.js");
+const { buildSearchQuery } = require("./helper/searchQuery.js");
 const targetSites = require("./config/targetSites.js");
 const brandTargets = require("./config/brandTargets.js");
 
@@ -186,23 +187,24 @@ async function buildCandidatesFromApi(targetConfig, doc, query) {
     return candidates;
 }
 
-// Mode S: the target's own search API answers a query with full candidates in
-// one request (Mumzworld's Algolia index), so there is no search page to parse
-// and no fetch per candidate. Throws when the request fails, so each caller
-// keeps its own posture — the legacy flow retries, the brand flow skips.
+// Mode S: an API answers the search with full candidate data (Mumzworld's
+// Algolia index, Amazon India's SP-API catalog, Flipkart's msite APIs), so
+// there is no search page to parse and no fetch per candidate. Throws when the
+// search fails, so each caller keeps its own posture — the legacy flow
+// retries, the brand flow skips.
 async function buildCandidatesFromSearchApi(targetConfig, query) {
     const api = targetConfig.searchApi;
 
-    // Logged with the query, not the URL: the request is a GET whose
-    // credentials travel in headers, but the query is what's worth reading.
-    const response = await timing.step(
+    // Logged with the query, not a URL: credentials travel in headers, and
+    // the query is what's worth reading.
+    const hits = await timing.step(
         `${targetConfig.label} search API`,
-        () => fetchJson(api.buildUrl(query), { headers: api.headers() }),
-        { detail: query, summarize: (r) => `${api.extractHits(r).length} result(s)` }
+        () => api.search(query),
+        { detail: query, summarize: (results) => `${results.length} result(s)` }
     );
 
     const candidates = [];
-    for (const hit of api.extractHits(response)) {
+    for (const hit of hits) {
         try {
             candidates.push(api.mapHit(hit));
         } catch (err) {
@@ -459,8 +461,11 @@ function pickBestMatch(matchData) {
 //   "mumzworld" -> Mumzworld's search API, which returns every candidate in
 //                  one request. Source rows are whatever the project holds,
 //                  e.g. Nahdi products scraped into ScratchProducts.
+//   "amazon"    -> Amazon India's SP-API catalog search (needs the
+//                  AMAZON_SPAPI_* credentials, see helper/spApiClient.js).
+//   "flipkart"  -> Flipkart's search + serviceability APIs.
 // ---------------------------------------------------------------------------
-const MATCHING_DESTINATIONS = ["nahdi", "mumzworld"];
+const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "amazon", "flipkart"];
 
 async function productMatching(brands, projectId, category, destination = "nahdi") {
     try {
@@ -477,6 +482,10 @@ async function productMatching(brands, projectId, category, destination = "nahdi
         }
 
         const targetConfig = targetSites[destination];
+
+        // A destination that can't work at all (e.g. no API credentials)
+        // fails here, once, instead of once per source product.
+        targetConfig.searchApi?.checkReady?.();
 
         // The browser is launched (and the Webshare proxy authenticated)
         // lazily by helper/browserClient.js on the first fetch below. This
@@ -538,9 +547,10 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             // from this one request; a search-page destination (Nahdi)
             // returns HTML, turned into candidates below.
             const usesSearchApi = Boolean(targetConfig.searchApi);
-            const url = usesSearchApi ? null : targetConfig.buildSearchUrl(sourceProduct.title);
+            const searchQuery = buildSearchQuery(sourceProduct);
+            const url = usesSearchApi ? null : targetConfig.buildSearchUrl(searchQuery);
 
-            console.log(x, sourceProduct.title, url || `(${targetConfig.label} search API)`);
+            console.log(x, searchQuery, url || `(${targetConfig.label} search API)`);
 
             let searchResult = null;
             try {
@@ -550,7 +560,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                 // escalate now; a retry gets a fresh browser context and
                 // therefore a fresh rotating exit IP instead.
                 searchResult = usesSearchApi
-                    ? await buildCandidatesFromSearchApi(targetConfig, sourceProduct.title)
+                    ? await buildCandidatesFromSearchApi(targetConfig, searchQuery)
                     : await timing.step(
                         `${targetConfig.label} search page fetch`,
                         () => fetchPage(url),
@@ -594,7 +604,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                 try {
                     productBatches = await timing.step(
                         `${targetConfig.label} candidate collection`,
-                        () => buildCandidatesFromDoc(targetConfig, doc, sourceProduct.title),
+                        () => buildCandidatesFromDoc(targetConfig, doc, searchQuery),
                         { summarize: (c) => `${c.length} candidate(s)` }
                     );
                 } catch (error) {
@@ -833,7 +843,7 @@ async function runBrandMatching(brandName, projectId, skus = null) {
 
                 const candidates = await timing.step(
                     `${targetConfig.label} candidate collection`,
-                    () => buildCandidatesFromSearch(targetConfig, sourceProduct.title),
+                    () => buildCandidatesFromSearch(targetConfig, buildSearchQuery(sourceProduct)),
                     { summarize: (c) => `${c.length} candidate(s)` }
                 );
                 if (candidates.length === 0) {
