@@ -364,12 +364,18 @@ function withStringTextFields(product) {
     return copy;
 }
 
+const MAX_MATCH_IMAGES = 4;
+
 // The request-body copy of a product: string text fields, and image URLs the
 // service can download (Google Drive share links turned into direct image
 // addresses — see helper/imageUrls.js). The stored product is not changed.
 function prepareForMatching(product) {
     const copy = withStringTextFields(product);
     if (copy.images != null) copy.images = toDirectImageUrls(copy.images);
+    // Every image sent is downloaded and compared by the service, and Amazon
+    // and Flipkart list up to 9-10 photos a product. Every target lists the
+    // main photo first, and the first few carry the comparison.
+    if (Array.isArray(copy.images)) copy.images = copy.images.slice(0, MAX_MATCH_IMAGES);
     return copy;
 }
 
@@ -380,7 +386,14 @@ function prepareForMatching(product) {
 // included, in request order, because `detail` locates a candidate only by
 // its index in comparable_products.
 function matchingServiceError(err, candidates) {
-    if (!err.response) return err;
+    // No response at all (timeout, refused connection): a short error, not
+    // axios's own — logging that dumps the whole request body.
+    if (!err.response) {
+        const skus = candidates.map((p) => p.sku).join(", ");
+        const wrapped = new Error(`Matching service request failed: ${err.message}${err.code ? ` (${err.code})` : ""} (candidate SKUs in order: ${skus})`);
+        wrapped.code = err.code;
+        return wrapped;
+    }
 
     const body = typeof err.response.data === "string" ? err.response.data : JSON.stringify(err.response.data);
     const reason = body && body.length > 1000 ? `${body.slice(0, 1000)}…` : body;
@@ -392,44 +405,73 @@ function matchingServiceError(err, candidates) {
     return wrapped;
 }
 
-// Sends originalProduct + every candidate to the matching microservice in ONE
-// request, image similarity included, and returns its field-score results.
-// This used to go in batches of 5, but the service's cost is almost all in
-// the first call for a product (~2.5s; each later call ~0.06s, per the
-// Beesline project 349 timing logs of 2026-10-12), so the extra round trips
-// bought nothing.
+// Sends originalProduct + candidates to the matching microservice in batches
+// of MATCHING_BATCH_SIZE, image similarity included, and returns the
+// flattened field-score results.
+//
+// Batches, not one request per product: the service downloads and compares
+// every image it is sent, and an Amazon India product's 20 candidates carry
+// ~70-150 photos (project 353, 2026-11-01). As one request that ran past the
+// 120s timeout once an Amazon and a Flipkart run shared the service. Each
+// batch gets its own timeout, and one that times out is sent once more.
+const MATCHING_BATCH_SIZE = 5;
+const MATCHING_TIMEOUT_MS = Number(process.env.MATCHING_TIMEOUT_MS) || 120000;
+const MATCHING_TIMEOUT_RETRIES = 1;
+
+function isTimeout(err) {
+    return err?.code === "ECONNABORTED" || err?.code === "ETIMEDOUT" || /timeout/i.test(err?.message || "");
+}
+
 async function callMatchingService(originalProduct, comparableProducts) {
     originalProduct.price = originalProduct.price ? parseFloat(originalProduct.price) : 0;
     originalProduct.mrp = originalProduct.mrp ? parseFloat(originalProduct.mrp) : 0;
 
-    const config = {
-        method: 'post',
-        maxBodyLength: Infinity,
-        url: MATCHING_SERVICE_URL,
-        headers: {
-            'accept': '*/*',
-            'accept-language': 'en-US,en;q=0.9',
-            'content-type': 'application/json',
-            'origin': 'https://www.mumzworld.com',
-            'referer': 'https://www.mumzworld.com/',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
-            'X-API-Key': "test123#"
-        },
-        data: {
-            "original_product": prepareForMatching(originalProduct),
-            "comparable_products": comparableProducts.map(prepareForMatching),
-            "include_image_similarity": true
-        },
-        timeout: 120000
-    };
+    const source = prepareForMatching(originalProduct);
+    const batchCount = Math.ceil(comparableProducts.length / MATCHING_BATCH_SIZE);
+    let matchData = [];
 
-    const matchResponse = await timing.step(
-        "Product matching",
-        () => axios.request(config).catch((err) => { throw matchingServiceError(err, comparableProducts); }),
-        { detail: `${comparableProducts.length} candidate(s) in one request` }
-    );
+    for (let i = 0; i < comparableProducts.length; i += MATCHING_BATCH_SIZE) {
+        const batch = comparableProducts.slice(i, i + MATCHING_BATCH_SIZE);
+        const batchNumber = i / MATCHING_BATCH_SIZE + 1;
 
-    return matchResponse.data;
+        const config = {
+            method: 'post',
+            maxBodyLength: Infinity,
+            url: MATCHING_SERVICE_URL,
+            headers: {
+                'accept': '*/*',
+                'accept-language': 'en-US,en;q=0.9',
+                'content-type': 'application/json',
+                'origin': 'https://www.mumzworld.com',
+                'referer': 'https://www.mumzworld.com/',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
+                'X-API-Key': "test123#"
+            },
+            data: {
+                "original_product": source,
+                "comparable_products": batch.map(prepareForMatching),
+                "include_image_similarity": true
+            },
+            timeout: MATCHING_TIMEOUT_MS
+        };
+
+        for (let attempt = 0; ; attempt++) {
+            try {
+                const matchResponse = await timing.step(
+                    `Product matching batch ${batchNumber}/${batchCount}${attempt > 0 ? ` (retry ${attempt})` : ""}`,
+                    () => axios.request(config),
+                    { detail: `${batch.length} candidate(s)` }
+                );
+                matchData = matchData.concat(matchResponse.data);
+                break;
+            } catch (err) {
+                if (isTimeout(err) && attempt < MATCHING_TIMEOUT_RETRIES) continue;
+                throw matchingServiceError(err, batch);
+            }
+        }
+    }
+
+    return matchData;
 }
 
 // Applies the "all four scores >= 0.85" rule (unchanged threshold) and
