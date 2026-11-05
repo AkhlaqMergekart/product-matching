@@ -18,9 +18,11 @@ for (const n of fs.readdirSync("logs")) {
   const head = fs.readFileSync("logs/" + n, "utf8").slice(0, 400);
   if (/Nykaa Fashion/.test(head)) destOf[m[1]] = "nykaafashion";
   else if (/Myntra/.test(head)) destOf[m[1]] = "myntra";
+  else if (/Foot Locker/.test(head)) destOf[m[1]] = "footlocker";
 }
 
-const out = { nykaafashion: new Map(), myntra: new Map() };
+const DESTS = ["nykaafashion", "myntra", "footlocker"];
+const out = Object.fromEntries(DESTS.map((dest) => [dest, new Map()]));
 const files = fs.readdirSync(".")
   .filter((n) => new RegExp("^products_matching_errors_.*_" + PROJECT + "_\\d+\\.json$").test(n))
   .map((n) => ({ n, t: Number(n.match(/_(\d+)\.json$/)[1]) }))
@@ -53,7 +55,7 @@ notes.push(`non-match here too, so "No matching products found" and "No products
 notes.push(`dominate. Genuine failures are "Max retries reached" and HTTP/service errors.`);
 notes.push("");
 
-for (const dest of ["nykaafashion", "myntra"]) {
+for (const dest of DESTS) {
   const rows = [...out[dest].values()];
   if (!rows.length) { notes.push(`  ${dest}: no error rows`); continue; }
 

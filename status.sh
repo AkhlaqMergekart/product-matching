@@ -11,7 +11,7 @@ echo "-- scripts --"
 pgrep -af "run-project" | grep -v "bash -c" | sed 's/^/  /' || echo "  none running"
 
 echo "-- progress --"
-for d in nykaafashion myntra; do
+for d in nykaafashion myntra footlocker; do
   f="progress_${P}_${d}.jsonl"
   if [ ! -f "$f" ]; then echo "  $d: not started"; continue; fi
   n=$(wc -l < "$f")
@@ -39,7 +39,7 @@ for f in $(ls -t logs/timing_*_${P}_*.log 2>/dev/null | head -6); do
   grep -q "Run ended" "$f" && continue
   age=$(( $(date +%s) - $(stat -c %Y "$f") ))
   [ $age -gt 180 ] && continue
-  dest=$(head -1 "$f" | grep -oE "Myntra|Nykaa Fashion")
+  dest=$(head -1 "$f" | grep -oE "Myntra|Nykaa Fashion|Foot Locker")
   echo "  ${dest:-?}: $(tail -1 "$f" | sed 's/^[0-9-]* //' | cut -c1-58) (${age}s ago)"
   A=1
 done

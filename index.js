@@ -764,12 +764,12 @@ function pickBestMatch(matchData) {
 //   "mumzworld" -> Mumzworld's search API, which returns every candidate in
 //                  one request. Source rows are whatever the project holds,
 //                  e.g. Nahdi products scraped into ScratchProducts.
-//   "myntra" / "nykaafashion"
+//   "myntra" / "nykaafashion" / "footlocker"
 //               -> one search page per source product, searched by brand +
 //                  title, with every candidate read off that page's own
 //                  hydration JSON. First page of results only.
 // ---------------------------------------------------------------------------
-const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "myntra", "nykaafashion"];
+const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "myntra", "nykaafashion", "footlocker"];
 
 async function productMatching(brands, projectId, category, destination = "nahdi") {
     try {

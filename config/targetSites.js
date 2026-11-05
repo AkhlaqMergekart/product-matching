@@ -132,6 +132,59 @@ function extractAssignedJson(doc, prefix) {
   return null;
 }
 
+// Pulls one balanced JSON object out of a larger script body. Used for
+// Foot Locker's `window.footlocker = { STATE_FROM_SERVER: {...}, ... }`
+// payload, where the state object is followed by more properties on the same
+// assignment and therefore cannot be sliced to the end of the script.
+function parseJsonObjectAt(text, start) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === "\"") inString = false;
+      continue;
+    }
+
+    if (ch === "\"") inString = true;
+    else if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return JSON.parse(text.slice(start, i + 1));
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractFootlockerState(doc) {
+  const marker = "STATE_FROM_SERVER:";
+
+  for (const script of xpath.select("//script", doc)) {
+    const text = script.textContent || "";
+    const markerIndex = text.indexOf(marker);
+    if (markerIndex === -1) continue;
+
+    const start = text.indexOf("{", markerIndex + marker.length);
+    if (start === -1) continue;
+
+    try {
+      return parseJsonObjectAt(text, start);
+    } catch (err) {
+      return null;
+    }
+  }
+
+  return null;
+}
+
 // Query text for a target that searches better on brand + title than on title
 // alone (see `buildQuery` in the Myntra / Nykaa Fashion entries). Prepends the
 // source product's brand unless its title already carries it, so a title like
@@ -178,6 +231,10 @@ function slugify(query) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+function productSlug(value) {
+  return slugify(String(value || "").replace(/'s\b/gi, "s"));
 }
 
 // Casefold, strip accents, drop everything that isn't a letter or digit. Used
@@ -237,6 +294,116 @@ function prefixBrand(brand, text) {
 
   const escaped = brandName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(^|\\W)${escaped}($|\\W)`, "i").test(name) ? name : `${brandName} ${name}`;
+}
+
+const FOOTLOCKER_BRAND_HINTS = [
+  "New Balance",
+  "Under Armour",
+  "The North Face",
+  "Mitchell & Ness",
+  "Pro Standard",
+  "New Era",
+  "Air Jordan",
+  "Adidas Originals",
+  "Adidas",
+  "Asics",
+  "Birkenstock",
+  "Brooks",
+  "Champion",
+  "Converse",
+  "Crocs",
+  "Diadora",
+  "Fila",
+  "Hoka",
+  "Jordan",
+  "K-Swiss",
+  "Lacoste",
+  "Merrell",
+  "Nike",
+  "On",
+  "Puma",
+  "Reebok",
+  "Salomon",
+  "Saucony",
+  "Skechers",
+  "Timberland",
+  "UGG",
+  "Vans",
+];
+
+function footlockerFacetBrands(state) {
+  const facets = state?.search?.facets || state?.app?.lastAction?.payload?.facets || [];
+  const facet = facets.find((f) => /^brand$/i.test(String(f?.code || f?.name || "").trim()));
+  return (Array.isArray(facet?.values) ? facet.values : [])
+    .map((v) => String(v?.name || "").trim())
+    .filter(Boolean);
+}
+
+function inferFootlockerBrand(name, hints) {
+  const normalizedName = normalizeBrandText(name);
+  const candidates = [...new Set([...(hints || []), ...FOOTLOCKER_BRAND_HINTS])]
+    .filter(Boolean)
+    .sort((a, b) => normalizeBrandText(b).length - normalizeBrandText(a).length);
+
+  for (const brand of candidates) {
+    const normalizedBrand = normalizeBrandText(brand);
+    if (normalizedBrand && normalizedName.startsWith(normalizedBrand)) {
+      return brand;
+    }
+  }
+
+  // Foot Locker product names normally lead with the brand. This keeps the
+  // brand gate usable even when the brand facet is absent for a niche query.
+  return String(name || "").trim().split(/\s+/)[0] || "";
+}
+
+function footlockerProductUrl(product) {
+  const sku = String(product?.sku || product?.baseProduct || "").trim();
+  if (!sku) return "";
+  const slug = productSlug(product?.name || "product") || "~";
+  return `https://www.footlocker.com/product/${slug}/${encodeURIComponent(sku)}.html`;
+}
+
+function footlockerImages(item) {
+  return (Array.isArray(item?.images) ? item.images : [])
+    .map((img) => typeof img === "string" ? img : img?.url)
+    .filter((url) => typeof url === "string" && url.trim());
+}
+
+function footlockerPrice(price) {
+  if (price && typeof price === "object") {
+    return round2(price.value ?? price.salePrice ?? price.listPrice);
+  }
+  return round2(price);
+}
+
+function footlockerListPrice(price) {
+  if (price && typeof price === "object") {
+    return round2(price.value ?? price.listPrice ?? price.salePrice);
+  }
+  return round2(price);
+}
+
+function footlockerDetailData(state) {
+  const apiData = state?.api?.productDetails?.getDetails?.data;
+  if (apiData) return apiData;
+  return state?.app?.lastAction?.type === "@product_details/GET_DETAILS"
+    ? state.app.lastAction.payload
+    : null;
+}
+
+function footlockerSizeLabel(item) {
+  return String(item?.size || item?.sizeValue || item?.name || item?.label || "").trim();
+}
+
+function footlockerSizeAvailable(item) {
+  const inv = item?.inventory || {};
+  return item?.active !== false && inv.inventoryAvailable !== false;
+}
+
+function textPart(value) {
+  if (typeof value === "string" || typeof value === "number") return String(value).trim();
+  return "";
 }
 
 const targetSites = {
@@ -1143,6 +1310,165 @@ const targetSites = {
           brandOrdersFulfilled: brandBookFigure(bookItems, /orders fulfilled/i),
           brandAverageRating: brandBookFigure(bookItems, /average rating/i),
           brandCustomerRatings: brandBookFigure(bookItems, /customer ratings/i),
+        };
+      },
+    },
+  },
+
+  footlocker: {
+    id: "footlocker",
+    label: "Foot Locker",
+    scraper: "axios",
+    needsDetailFetch: false,
+
+    // Same search posture as Nykaa Fashion: first page only, with query text
+    // composed as brand + title. Foot Locker's result page ships the full
+    // first-page product array in `window.footlocker.STATE_FROM_SERVER`, so a
+    // single GET is enough to build candidates.
+    buildQuery: composeBrandTitleQuery,
+
+    buildSearchUrl: (query) =>
+      `https://www.footlocker.com/search?query=${encodeURIComponent(query)}`,
+
+    scraperOptions: {
+      mustContain: "STATE_FROM_SERVER",
+      retryStatuses: [404],
+      headers: {
+        referer: "https://www.footlocker.com/",
+      },
+    },
+
+    extractListingProducts: (doc) => {
+      const state = extractFootlockerState(doc);
+      const products = state?.search?.products || state?.app?.lastAction?.payload?.products || [];
+      if (!Array.isArray(products)) return [];
+
+      const brandHints = footlockerFacetBrands(state);
+
+      return products
+        .map((item) => {
+          const name = String(item?.name || "").trim();
+          const brand = inferFootlockerBrand(name, brandHints);
+          const selectedStyle = (Array.isArray(item?.baseOptions) ? item.baseOptions : [])
+            .map((opt) => opt?.selected?.style)
+            .find((style) => typeof style === "string" && style.trim()) || "";
+
+          const price = footlockerPrice(item?.price);
+          const mrp = footlockerListPrice(item?.originalPrice) || price;
+
+          return {
+            url: footlockerProductUrl(item),
+            category: "",
+            brand,
+            title: name,
+            sku: String(item?.sku || item?.baseProduct || ""),
+            price,
+            mrp,
+            totalRating: item?.reviewRatings?.rating != null ? String(round2(item.reviewRatings.rating)) : "",
+            totalReview: item?.reviewRatings?.reviews != null ? String(item.reviewRatings.reviews) : "",
+            express: false,
+            description: selectedStyle ? `Color: ${selectedStyle}` : "",
+            images: footlockerImages(item),
+            color: selectedStyle,
+            variants: (Array.isArray(item?.variantOptions) ? item.variantOptions : []).map((variant) => ({
+              sku: String(variant?.sku || ""),
+              color: String(variant?.color || "").trim(),
+              available: variant?.sellable !== false && variant?.flagsAndRestrictions?.isBannerOnly !== true,
+              price: footlockerPrice(variant?.price),
+              mrp: footlockerListPrice(variant?.price),
+              images: footlockerImages(variant),
+            })),
+          };
+        })
+        .filter((p) => p.url && p.sku);
+    },
+
+    // Matched/top candidates only. The page uses the same
+    // STATE_FROM_SERVER payload, but with `api.productDetails.getDetails.data`
+    // populated: model copy, active style, per-size inventory, colour variants
+    // and reviews. If Foot Locker serves a generic shell instead, extraction
+    // returns an error object and the already-decided match is preserved.
+    matchedDetail: {
+      buildUrl: (candidate) => candidate.url || footlockerProductUrl(candidate),
+
+      extract: (doc, url) => {
+        const state = extractFootlockerState(doc);
+        const data = footlockerDetailData(state);
+        if (!data) return { url, error: "no Foot Locker product detail state" };
+
+        const model = data.model || {};
+        const style = data.style || {};
+        const reviews = data.reviews || {};
+        const brand = String(model.brand || "").trim();
+        const title = prefixBrand(brand, model.name || style.style || style.name || "") || String(model.name || "");
+        const currentSku = String(style.sku || data.id || "").replace(/_fl_enus$/, "");
+        const sizes = Array.isArray(data.sizes) ? data.sizes : [];
+        const variants = (Array.isArray(data.styleVariants) ? data.styleVariants : [])
+          .filter((variant) => !currentSku || String(variant?.sku || "") === currentSku);
+
+        const sizeRows = variants.length > 0 ? variants : sizes;
+        const allSizes = sizeRows.map(footlockerSizeLabel).filter(Boolean);
+        const inStockSizes = sizeRows.filter(footlockerSizeAvailable).map(footlockerSizeLabel).filter(Boolean);
+
+        const styleImages = currentSku ? [`https://images.footlocker.com/is/image/EBFL2/${currentSku}`] : [];
+        const category = [
+          ...(Array.isArray(model?.genders) ? model.genders.map(textPart) : []),
+          model?.productHierarchy?.division,
+          model?.productHierarchy?.department,
+          model?.productHierarchy?.class,
+          model?.productHierarchy?.subclass,
+        ].map(textPart).filter(Boolean).join(" > ");
+
+        const colorOptions = [];
+        const seenColors = new Set();
+        for (const variant of Array.isArray(data.styleVariants) ? data.styleVariants : []) {
+          const sku = String(variant?.sku || "").trim();
+          const color = String(variant?.color || "").trim();
+          const key = `${sku}||${color}`;
+          if (!sku || seenColors.has(key)) continue;
+          seenColors.add(key);
+          colorOptions.push({
+            label: color,
+            sku,
+            url: footlockerProductUrl({ sku, name: variant?.style || model.name }),
+            price: footlockerPrice(variant?.price),
+            mrp: footlockerListPrice(variant?.price),
+          });
+        }
+
+        return {
+          url,
+          sku: currentSku,
+          supplierSku: String(style.supplierSku || style.supplierSkus || model.supplierSku || ""),
+          title,
+          brand,
+          category,
+          rating: reviews.averageRating != null ? String(round2(reviews.averageRating)) : "",
+          ratingCount: reviews.totalReviews != null ? String(reviews.totalReviews) : "",
+          reviewCount: reviews.totalReviews != null ? String(reviews.totalReviews) : "",
+          size: inStockSizes.join(", "),
+          sizesAll: allSizes.join(", "),
+          images: styleImages,
+          variants: sizeRows.map((variant) => ({
+            size: footlockerSizeLabel(variant),
+            available: footlockerSizeAvailable(variant),
+            sku: String(variant?.upc || variant?.productWebKey || ""),
+            price: footlockerPrice(variant?.price || style.price),
+            mrp: footlockerListPrice(variant?.price || style.price),
+          })).filter((variant) => variant.size),
+          colourOptions: colorOptions,
+          color: String(style.color || "").trim(),
+          mrp: footlockerListPrice(style.price),
+          price: footlockerPrice(style.price),
+          description: htmlToText(model.description || ""),
+          descriptionHtml: model.description || "",
+          specifications: {
+            style: String(style.color || "").trim(),
+            width: String(style.width || "").trim(),
+            gender: (Array.isArray(model.genders) ? model.genders.map(textPart).filter(Boolean) : []).join(", "),
+            productType: textPart(model.productHierarchy?.subclass || model.productHierarchy?.class),
+            modelNumber: model.number != null ? String(model.number) : "",
+          },
         };
       },
     },

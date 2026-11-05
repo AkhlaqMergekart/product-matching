@@ -28,6 +28,10 @@ const HTTP_SCRAPERS = new Set(["axios", "http"]);
 //   headers  -> forwarded to the target site (locale, etc.)
 //   renderJs -> browser only; false skips waiting for network idle
 //   country  -> accepted but not enforced (see browserClient.js)
+//   mustContain -> HTML marker that must be present; a missing marker is
+//                  treated like a block page and costs the current attempt
+//   retryStatuses -> HTTP statuses that this target wants retried even if the
+//                    generic client would normally treat them as permanent
 async function fetchHtml(scraperType, url, options = {}) {
   const type = scraperType || "axios";
 

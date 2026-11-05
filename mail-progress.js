@@ -10,7 +10,7 @@ const config = require("./config.json");
 
 const PROJECT = 353;
 const TOTAL = 2852;
-const DESTS = ["nykaafashion", "myntra"];
+const DESTS = ["nykaafashion", "myntra", "footlocker"];
 const TO = process.env.REPORT_EMAIL || "jaineel@mergekart.com";
 
 function readLedger(dest) {

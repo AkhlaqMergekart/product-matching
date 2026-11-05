@@ -110,7 +110,7 @@ const PERMANENT_STATUSES = new Set([404, 410]);
 class PermanentHttpError extends Error {}
 
 // One attempt. Throws on anything that should cost us this IP.
-async function attempt(url, { headers, timeout, expectJson }) {
+async function attempt(url, { headers, timeout, expectJson, mustContain, retryStatuses }) {
   const response = await axios.request({
     method: "get",
     url,
@@ -129,7 +129,7 @@ async function attempt(url, { headers, timeout, expectJson }) {
 
   requestsThisSession += 1;
 
-  if (PERMANENT_STATUSES.has(response.status)) {
+  if (PERMANENT_STATUSES.has(response.status) && !retryStatuses.has(response.status)) {
     throw new PermanentHttpError(`HTTP ${response.status} for ${url}`);
   }
 
@@ -147,6 +147,10 @@ async function attempt(url, { headers, timeout, expectJson }) {
     throw new Error(`Blocked by anti-bot page (${html.length} bytes) for ${url}`);
   }
 
+  if (mustContain && !html.includes(mustContain)) {
+    throw new Error(`Missing required marker "${mustContain}" (${html.length} bytes) for ${url}`);
+  }
+
   return html;
 }
 
@@ -162,7 +166,13 @@ async function fetchWithRotation(url, options, expectJson) {
 
   for (let i = 1; i <= MAX_ATTEMPTS; i++) {
     try {
-      return await attempt(url, { headers, timeout: options.timeout, expectJson });
+      return await attempt(url, {
+        headers,
+        timeout: options.timeout,
+        expectJson,
+        mustContain: options.mustContain,
+        retryStatuses: new Set(options.retryStatuses || []),
+      });
     } catch (err) {
       lastError = err;
 

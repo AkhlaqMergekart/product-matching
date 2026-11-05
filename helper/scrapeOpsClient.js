@@ -53,6 +53,7 @@ function isConfigured() {
 //   country  -> country. Honoured here, unlike the browser path, since
 //               ScrapeOps geo-targets per request.
 //   headers  -> forwarded to the target site.
+//   mustContain -> HTML marker that must be present in a successful response.
 function buildUrl(url, options = {}) {
   const params = new URLSearchParams({ api_key: API_KEY, url });
 
@@ -119,6 +120,10 @@ async function fetchViaScrapeOps(url, options = {}) {
 
   if (isBlockPage(html)) {
     throw new Error(`ScrapeOps returned an anti-bot page (${html.length} bytes) for ${url}`);
+  }
+
+  if (options.mustContain && !html.includes(options.mustContain)) {
+    throw new Error(`ScrapeOps returned a page without required marker "${options.mustContain}" (${html.length} bytes) for ${url}`);
   }
 
   return html;

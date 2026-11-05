@@ -19,6 +19,7 @@ const sendUpdateReportEmail = require("./helper/sendUpdateReport.js");
 const config = require("./config.json");
 
 const PROJECT = 353;
+const TOTAL = parseInt(process.env.PROJECT_TOTAL || "2852", 10);
 const TO = process.env.REPORT_EMAIL || "jaineel@mergekart.com";
 const GMAIL_LIMIT = 24 * 1024 * 1024; // leave headroom under Gmail's ~25MB
 
@@ -30,11 +31,32 @@ for (const n of fs.readdirSync("logs")) {
   const head = fs.readFileSync("logs/" + n, "utf8").slice(0, 400);
   if (/Nykaa Fashion/.test(head)) destOf[m[1]] = "nykaafashion";
   else if (/Myntra/.test(head)) destOf[m[1]] = "myntra";
+  else if (/Foot Locker/.test(head)) destOf[m[1]] = "footlocker";
+}
+
+const DESTS = ["nykaafashion", "myntra", "footlocker"];
+
+function progressCount(dest) {
+  const file = `progress_${PROJECT}_${dest}.jsonl`;
+  if (!fs.existsSync(file)) return null;
+
+  const skus = new Set();
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (row && row.sku != null) skus.add(String(row.sku));
+    } catch (err) {
+      // Tolerate a torn final line while a run is appending.
+    }
+  }
+
+  return skus.size;
 }
 
 function collect(prefix) {
   // dest -> sku -> {entry, t}
-  const out = { nykaafashion: new Map(), myntra: new Map() };
+  const out = Object.fromEntries(DESTS.map((dest) => [dest, new Map()]));
   const files = fs.readdirSync(".")
     .filter((n) => new RegExp("^" + prefix + "_" + (prefix === "products_matched" ? "(?!final_)" : "") + ".*_" + PROJECT + "_\\d+\\.json$").test(n))
     .map((n) => ({ n, t: Number(n.match(/_(\d+)\.json$/)[1]) }))
@@ -62,13 +84,16 @@ const attachments = [];
 const notes = [];
 notes.push(`Consolidated output - projectId ${PROJECT}`);
 notes.push(`Generated: ${new Date().toISOString()}`);
-notes.push(`NOTE: the runs are STILL IN PROGRESS - this is a snapshot.`);
 notes.push("");
 notes.push(`Source chunk files: products_matched ${raw.files}, products_matched_final ${fin.files}`);
 notes.push(`De-duplicated by SKU per destination (newest chunk wins).`);
+notes.push(`Progress is shown as processed/total; ${TOTAL} is the expected total project SKU count.`);
 notes.push("");
 
-for (const dest of ["nykaafashion", "myntra"]) {
+for (const dest of DESTS) {
+  const processed = progressCount(dest);
+  notes.push(`  ${dest}: processed ${processed == null ? "not started" : `${processed}/${TOTAL}`}`);
+
   for (const [label, src] of [["products_matched", raw], ["products_matched_final", fin]]) {
     const rows = [...src.out[dest].values()];
     if (rows.length === 0) continue;
@@ -112,7 +137,7 @@ notes.push(`Total attachment size: ${(total / 1048576).toFixed(2)} MB`);
   await sendUpdateReportEmail({
     from: config.FROM_EMAIL,
     to: TO,
-    subject: `Consolidated product matching output - project ${PROJECT} (snapshot, run in progress)`,
+    subject: `Consolidated product matching output - project ${PROJECT}`,
     text: notes.join("\n"),
     attachments,
   });

@@ -91,6 +91,7 @@ Each entry describes everything specific to one target site:
 | `amazonAE` | `needsDetailFetch: false` | 1 browser page (+ capped brand top-ups) | Uses Amazon's stable `data-component-type='s-search-result'` + `data-asin` hooks instead of a utility-class selector already found to be stale. **See the proxy-reputation caveat in section 5** |
 | `myntra` | `needsDetailFetch: false` (axios) | 1 search page, a plain GET | Searched by **brand + title**, first page of results only. Candidates read off `window.__myx` — the JSON the site's own React app hydrates from — not the DOM, since the grid is rendered client-side. Verified live 2026-10-31: 690 KB → 50 candidates, 0 missing title/brand/price/images |
 | `nykaafashion` | `needsDetailFetch: false` (axios) | 1 search page, a plain GET | Same shape as Myntra, reading `<script id="__PRELOADED_STATE__">` → `listingV2.products`. Verified live 2026-10-31: 840 KB → 36 candidates, 0 incomplete. No category: the blob carries only numeric `categoryId`s with no names anywhere on the page |
+| `footlocker` | `needsDetailFetch: false` (axios) | 1 search page, a plain GET | Same first-page search flow as Nykaa/Myntra, reading `window.footlocker.STATE_FROM_SERVER` → `search.products`. Matched/top candidates are enriched from `api.productDetails.getDetails.data` on the product page for sizes, prices, ratings, colours and description. Verified live 2026-11-05: 1.8 MB → 48 candidates for "Nike Air Max 90"; project 353 probes found real New Balance 530 and FuelCell Rebel v5 candidates |
 
 **Two field traps in these two, both verified against live samples rather than read off the field names:**
 
@@ -101,7 +102,7 @@ Each entry describes everything specific to one target site:
   shopper pays (4895 / 2937 at a 40% discount on the verified sample). This is the same trap as
   Nahdi's `shelf_price`, which once recorded a 254.00 product at 878.60.
 
-Both sites are fetched with **no browser and no ScrapeOps credits** — a plain GET through
+These hydration-JSON sites are fetched with **no browser and no ScrapeOps credits** — a plain GET through
 Webshare returns the fully populated blob, because it is server-rendered for the app to hydrate
 from.
 
@@ -385,6 +386,11 @@ fallback without any per-target config. Two deliberate properties:
 
 - **404/410 never reach ScrapeOps.** `PermanentHttpError` means "this URL is gone", not "this IP
   is unwelcome", so it fails fast rather than spending a paid request to be told the same thing.
+  A target can opt a status back into retrying via `scraperOptions.retryStatuses`; Foot Locker
+  does this for `404`, which it has been seen to return from a bad proxy exit for a valid URL.
+- **Targets can require a success marker.** `scraperOptions.mustContain` rejects pages that do
+  not contain a required string. Foot Locker uses `STATE_FROM_SERVER` so a generic Europe shell
+  or anti-bot page cannot silently turn into "0 candidates".
 - **A missing key degrades to exactly the old behaviour.** `isConfigured()` is false, the
   Webshare error is re-thrown verbatim, and nothing anywhere reports an auth problem. A failed
   fetch should not become a confusing credentials error just because a fallback exists.
@@ -418,7 +424,7 @@ has effectively already been tried, since Webshare's own rotation failed before 
 
 | Endpoint | Status | Behavior |
 |---|---|---|
-| `POST /product-matching` | Legacy, unchanged | `{ brand: [skus...], projectId, category?, destination? }` — checks a specific SKU list against one target. `destination` is one of `nahdi` (the default) \| `mumzworld` \| `myntra` \| `nykaafashion`; the parameter is named `destination`, not `target`, as an earlier revision of this table said. Existing callers keep working exactly as before. |
+| `POST /product-matching` | Legacy, unchanged | `{ brand: [skus...], projectId, category?, destination? }` — checks a specific SKU list against one target. `destination` is one of `nahdi` (the default) \| `mumzworld` \| `myntra` \| `nykaafashion` \| `footlocker`; the parameter is named `destination`, not `target`, as an earlier revision of this table said. Existing callers keep working exactly as before. |
 | `POST /product-matching/brand` | New | `{ brandName, projectId }` — runs every target configured for that brand in `brandTargets.js`, pulls the brand's whole catalog automatically (no SKU list needed), combines results into one spreadsheet. |
 
 ---
@@ -520,5 +526,6 @@ builder, scraper choice, and either `extractListingProducts` (no detail fetch) o
 To add a new **brand**: add an entry to `config/brandTargets.js` naming which already-
 configured targets it should run against, with `direction: "forward"`.
 
-No changes to `index.js`, `helper/scrapeClient.js`, or `helper/exportResults.js` are needed
-for either case — that's the point of the config-driven split.
+For the matching mechanics, no changes to `helper/exportResults.js` are needed — that's the
+point of the config-driven split. A newly named destination still needs to be added to
+`MATCHING_DESTINATIONS` in `index.js` so the public API allowlist accepts it.
