@@ -405,73 +405,100 @@ function matchingServiceError(err, candidates) {
     return wrapped;
 }
 
-// Sends originalProduct + candidates to the matching microservice in batches
-// of MATCHING_BATCH_SIZE, image similarity included, and returns the
-// flattened field-score results.
-//
-// Batches, not one request per product: the service downloads and compares
-// every image it is sent, and an Amazon India product's 20 candidates carry
-// ~70-150 photos (project 353, 2026-11-01). As one request that ran past the
-// 120s timeout once an Amazon and a Flipkart run shared the service. Each
-// batch gets its own timeout, and one that times out is sent once more.
+// The service compares images one request at a time and scores text in about
+// a second, while each candidate with images costs ~9s or more. Scoring every
+// candidate with images ran past the old 120s timeout, and each abandoned
+// request stayed queued in the service, so everything behind it timed out too
+// (2026-11-04). So a timeout here is not retried, and is long enough for a
+// batch that is merely waiting its turn.
 const MATCHING_BATCH_SIZE = 5;
-const MATCHING_TIMEOUT_MS = Number(process.env.MATCHING_TIMEOUT_MS) || 120000;
-const MATCHING_TIMEOUT_RETRIES = 1;
+const MATCHING_TIMEOUT_MS = Number(process.env.MATCHING_TIMEOUT_MS) || 600000;
+const IMAGE_SCORING_TOP_N = 10;
 
-function isTimeout(err) {
-    return err?.code === "ECONNABORTED" || err?.code === "ETIMEDOUT" || /timeout/i.test(err?.message || "");
+async function requestMatch(source, candidates, includeImages, label) {
+    const config = {
+        method: 'post',
+        maxBodyLength: Infinity,
+        url: MATCHING_SERVICE_URL,
+        headers: {
+            'accept': '*/*',
+            'accept-language': 'en-US,en;q=0.9',
+            'content-type': 'application/json',
+            'origin': 'https://www.mumzworld.com',
+            'referer': 'https://www.mumzworld.com/',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
+            'X-API-Key': "test123#"
+        },
+        data: {
+            "original_product": source,
+            "comparable_products": candidates,
+            "include_image_similarity": includeImages
+        },
+        timeout: MATCHING_TIMEOUT_MS
+    };
+
+    try {
+        const response = await timing.step(
+            label,
+            () => axios.request(config),
+            { detail: `${candidates.length} candidate(s)` }
+        );
+        return Array.isArray(response.data) ? response.data : [];
+    } catch (err) {
+        throw matchingServiceError(err, candidates);
+    }
 }
 
+function byCompositeScore(a, b) {
+    return (b.composite_score || 0) - (a.composite_score || 0);
+}
+
+// Scores every candidate on text, then compares images only for the best
+// IMAGE_SCORING_TOP_N that clear the brand threshold, in batches of
+// MATCHING_BATCH_SIZE. A candidate below that threshold can never be a match,
+// so its images are not worth comparing. Returns every candidate, best first;
+// those left out of the image pass keep their text-only scores.
 async function callMatchingService(originalProduct, comparableProducts) {
     originalProduct.price = originalProduct.price ? parseFloat(originalProduct.price) : 0;
     originalProduct.mrp = originalProduct.mrp ? parseFloat(originalProduct.mrp) : 0;
 
     const source = prepareForMatching(originalProduct);
-    const batchCount = Math.ceil(comparableProducts.length / MATCHING_BATCH_SIZE);
-    let matchData = [];
+    const candidates = comparableProducts.map(prepareForMatching);
 
-    for (let i = 0; i < comparableProducts.length; i += MATCHING_BATCH_SIZE) {
-        const batch = comparableProducts.slice(i, i + MATCHING_BATCH_SIZE);
-        const batchNumber = i / MATCHING_BATCH_SIZE + 1;
+    const textScored = await requestMatch(source, candidates, false, "Product matching pass 1 (text only)");
 
-        const config = {
-            method: 'post',
-            maxBodyLength: Infinity,
-            url: MATCHING_SERVICE_URL,
-            headers: {
-                'accept': '*/*',
-                'accept-language': 'en-US,en;q=0.9',
-                'content-type': 'application/json',
-                'origin': 'https://www.mumzworld.com',
-                'referer': 'https://www.mumzworld.com/',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
-                'X-API-Key': "test123#"
-            },
-            data: {
-                "original_product": source,
-                "comparable_products": batch.map(prepareForMatching),
-                "include_image_similarity": true
-            },
-            timeout: MATCHING_TIMEOUT_MS
-        };
+    const brandMatches = textScored
+        .filter((entry) => entry.field_scores?.brand >= MATCH_THRESHOLD)
+        .sort(byCompositeScore);
 
-        for (let attempt = 0; ; attempt++) {
-            try {
-                const matchResponse = await timing.step(
-                    `Product matching batch ${batchNumber}/${batchCount}${attempt > 0 ? ` (retry ${attempt})` : ""}`,
-                    () => axios.request(config),
-                    { detail: `${batch.length} candidate(s)` }
-                );
-                matchData = matchData.concat(matchResponse.data);
-                break;
-            } catch (err) {
-                if (isTimeout(err) && attempt < MATCHING_TIMEOUT_RETRIES) continue;
-                throw matchingServiceError(err, batch);
-            }
-        }
+    if (brandMatches.length === 0) {
+        timing.logEvent(`No candidate clears the brand threshold, image pass skipped (${textScored.length} scored on text)`);
+        return textScored;
     }
 
-    return matchData;
+    // Send our own candidate objects: the service's response strips `images`.
+    const top = brandMatches.slice(0, IMAGE_SCORING_TOP_N);
+    const topSkus = new Set(top.map((entry) => String(entry.product?.sku)));
+    const imageCandidates = candidates.filter((candidate) => topSkus.has(String(candidate.sku)));
+
+    if (imageCandidates.length === 0) {
+        timing.logEvent("Service response carried no known SKUs, image pass skipped");
+        return textScored;
+    }
+
+    const batchCount = Math.ceil(imageCandidates.length / MATCHING_BATCH_SIZE);
+    let imageScored = [];
+
+    for (let i = 0; i < imageCandidates.length; i += MATCHING_BATCH_SIZE) {
+        const batch = imageCandidates.slice(i, i + MATCHING_BATCH_SIZE);
+        const batchNumber = i / MATCHING_BATCH_SIZE + 1;
+        imageScored = imageScored.concat(
+            await requestMatch(source, batch, true, `Product matching pass 2 (images) batch ${batchNumber}/${batchCount}`)
+        );
+    }
+
+    const textOnly = textScored.filter((entry) => !topSkus.has(String(entry.product?.sku)));
+    return imageScored.concat(textOnly).sort(byCompositeScore);
 }
 
 // Applies the "all four scores >= 0.85" rule (unchanged threshold) and

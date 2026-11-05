@@ -147,9 +147,11 @@ still returned.
 ### 4.3 `callMatchingService(originalProduct, comparableProducts)`
 
 Sends the source product plus its candidates to the external matching microservice
-(`POST localhost:8000/api/match`), in batches of 5 candidates per request. Returns the
-flattened array of per-candidate `field_scores` (`title`, `brand`, `color`, 
-`image_similarity`).
+(`POST localhost:8000/api/match`) in two passes. Pass 1 scores every candidate on text in one
+request. Pass 2 compares images only for the top 10 candidates with a brand score `>= 0.85`, in
+batches of 5; if none reach that score, it is skipped. Each request has a 10-minute timeout and
+a timed-out request is not retried. Returns every candidate's `field_scores` (`title`, `brand`,
+`color`, `image_similarity`), best first; candidates left out of pass 2 keep text-only scores.
 
 ### 4.4 `pickBestMatch(matchData)`
 
