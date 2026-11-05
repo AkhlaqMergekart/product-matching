@@ -1,7 +1,7 @@
 const { fetchViaBrowser, closeBrowser } = require("./browserClient.js");
 const { fetchPage, closeSession } = require("./httpClient.js");
 const { logEvent } = require("./timingLogger.js");
-const { tryScrapeOpsFallback } = require("./scrapeOpsClient.js");
+const { tryScrapeOpsFallback, fetchViaScrapeOps, isConfigured: scrapeOpsConfigured } = require("./scrapeOpsClient.js");
 const { scrapeOpsIsFallback } = require("../config/scrapingVendors.js");
 
 // Fetches `url` with whichever strategy `scraperType` names, retrying up to 3
@@ -30,6 +30,28 @@ const HTTP_SCRAPERS = new Set(["axios", "http"]);
 //   country  -> accepted but not enforced (see browserClient.js)
 async function fetchHtml(scraperType, url, options = {}) {
   const type = scraperType || "axios";
+
+  // Per-target override: ScrapeOps as the PRIMARY vendor (used by Myntra),
+  // tried directly up to 3 times before anything else. Premium routing only
+  // (no render_js, no cloudflare bypass) — i.e. the vendor-id-15 {"premium":
+  // true} variant, not the id-12 cloudflare_level_1 one. Only after all three
+  // attempts fail does it fall through to the normal Webshare path below.
+  if (options.scrapeOpsFirst && scrapeOpsConfigured()) {
+    const sops = { ...options, premium: true, renderJs: false };
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        return await fetchViaScrapeOps(url, sops);
+      } catch (err) {
+        lastError = err;
+        logEvent(`  ScrapeOps (primary) attempt ${attempt}/3 failed for ${url} — ${err.message}`);
+        if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+    logEvent(`  ScrapeOps primary exhausted for ${url} — falling back to Webshare`);
+    // Drop the flag so the fallback path doesn't loop back into ScrapeOps-first.
+    options = { ...options, scrapeOpsFirst: false };
+  }
 
   if (HTTP_SCRAPERS.has(type)) {
     // httpClient runs its own attempt loop, rotating the exit IP between

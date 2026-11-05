@@ -514,6 +514,15 @@ function matchingServiceError(err, candidates) {
 // The eventual match was inside the top 5 by text score on every run checked.
 // 0 disables the two-pass and scores everything, as before.
 const IMAGE_SCORING_TOP_N = parseInt(process.env.IMAGE_SCORING_TOP_N || "10", 10);
+// How many of the top-scored candidates get their product page fetched and
+// enriched (images, description, specifications, rating, reviews + Nykaa brand
+// figures). Enrichment used to run only for the single matched winner; this
+// runs it for the top N candidates so every strong candidate carries detail.
+const DETAIL_ENRICH_TOP_N = parseInt(process.env.DETAIL_ENRICH_TOP_N || "10", 10);
+// How many candidate product pages are fetched at once during enrichment. These
+// fetches run concurrently with the image pass; a small cap keeps the proxy from
+// being hit with all N at the same instant.
+const DETAIL_FETCH_CONCURRENCY = parseInt(process.env.DETAIL_FETCH_CONCURRENCY || "5", 10);
 
 function buildMatchRequest(originalProduct, comparableProducts, includeImages) {
     return {
@@ -564,21 +573,26 @@ async function requestMatch(originalProduct, comparableProducts, includeImages, 
 // fetch to a run that found something, and nothing at all to a run that did
 // not. The raw HTML is cached (helper/htmlCache.js) so further fields can be
 // pulled later without re-fetching.
-async function enrichMatchedProduct(targetConfig, matchedProduct, sourceSku) {
+async function enrichMatchedProduct(targetConfig, matchedProduct, sourceSku, kind) {
     const cfg = targetConfig.matchedDetail;
     if (!cfg) return null;
 
     const url = cfg.buildUrl(matchedProduct);
     if (!url) return null;
 
+    // The HTML cache is keyed by sourceSku + kind, so enriching several
+    // candidates for the same source product must pass a distinct kind
+    // (e.g. "candidate-<candidateSku>") or they overwrite one another.
+    const cacheKind = kind || "matched-product";
+
     try {
         const html = await timing.step(
-            `${targetConfig.label} matched product page fetch`,
+            `${targetConfig.label} product page fetch`,
             () => fetchHtml(targetConfig.scraper, url, targetConfig.scraperOptions),
             { detail: url, summarize: describeHtml }
         );
 
-        const htmlFile = saveHtml(targetConfig.id, sourceSku, "matched-product", url, html);
+        const htmlFile = saveHtml(targetConfig.id, sourceSku, cacheKind, url, html);
 
         const $ = cheerio.load(html);
         const detail = cfg.extract(new dom().parseFromString($.xml(), "text/xml"), url);
@@ -597,12 +611,45 @@ async function enrichMatchedProduct(targetConfig, matchedProduct, sourceSku) {
 // the strongest handful with images (expensive). Returns the full candidate
 // list either way, so nothing downstream sees a shorter set — the tail simply
 // keeps its text-only scores.
-async function callMatchingService(originalProduct, comparableProducts) {
+// Runs `fn` over `items` with at most `limit` in flight at once. Used to fetch
+// several candidate product pages concurrently without opening all of them on
+// the proxy at the same instant.
+async function mapWithConcurrency(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+    async function worker() {
+        while (next < items.length) {
+            const i = next++;
+            results[i] = await fn(items[i], i);
+        }
+    }
+    const n = Math.min(limit, items.length) || 0;
+    await Promise.all(Array.from({ length: n }, worker));
+    return results;
+}
+
+// `enrichFn(product)` (optional) fetches a candidate's product-page detail. When
+// given, the top candidates are enriched CONCURRENTLY with the image pass — the
+// two slowest stages overlap instead of running back to back — and the detail is
+// attached to each candidate as `.detail`.
+async function callMatchingService(originalProduct, comparableProducts, enrichFn) {
     originalProduct.price = originalProduct.price ? parseFloat(originalProduct.price) : 0;
     originalProduct.mrp = originalProduct.mrp ? parseFloat(originalProduct.mrp) : 0;
 
+    // Enriches the given candidates in parallel and attaches `.detail` to each.
+    const enrichCandidates = async (candidates) => {
+        if (typeof enrichFn !== "function" || candidates.length === 0) return;
+        const details = await mapWithConcurrency(
+            candidates, DETAIL_FETCH_CONCURRENCY,
+            (e) => enrichFn(e.product)
+        );
+        candidates.forEach((e, i) => { e.detail = details[i]; });
+    };
+
     if (IMAGE_SCORING_TOP_N <= 0 || comparableProducts.length <= IMAGE_SCORING_TOP_N) {
-        return requestMatch(originalProduct, comparableProducts, true, "Product matching");
+        const scored = await requestMatch(originalProduct, comparableProducts, true, "Product matching");
+        await enrichCandidates(scored.slice(0, DETAIL_ENRICH_TOP_N));
+        return scored;
     }
 
     const textScored = await requestMatch(
@@ -625,6 +672,9 @@ async function callMatchingService(originalProduct, comparableProducts) {
 
     if (brandOk.length === 0) {
         timing.logEvent(`No candidate clears the brand gate — skipping the image pass (${textScored.length} candidate(s) scored on text only)`);
+        // No image pass to overlap with here, but the top candidates are still
+        // enriched so detail is present for every processed product.
+        await enrichCandidates(textScored.slice(0, DETAIL_ENRICH_TOP_N));
         return textScored;
     }
 
@@ -641,11 +691,35 @@ async function callMatchingService(originalProduct, comparableProducts) {
         .map((e) => bySku.get(String(e.product && e.product.sku)))
         .filter(Boolean);
 
-    if (topOriginals.length === 0) return textScored;
+    if (topOriginals.length === 0) {
+        await enrichCandidates(textScored.slice(0, DETAIL_ENRICH_TOP_N));
+        return textScored;
+    }
 
-    const imageScored = await requestMatch(
-        originalProduct, topOriginals, true, `Product matching pass 2 (images, top ${topOriginals.length} of ${brandOk.length} brand-matching)`
+    // Run the image pass and the candidate-detail fetches CONCURRENTLY. The top
+    // set is the same candidates either way, so enrichment does not need the
+    // image scores — overlapping the two removes the detail fetches from the
+    // critical path almost entirely. `enrichCandidates` attaches `.detail` to
+    // the `top` entries, which are the same objects carried in `imageScored`'s
+    // input ordering and merged below.
+    const [imageScored] = await Promise.all([
+        requestMatch(
+            originalProduct, topOriginals, true,
+            `Product matching pass 2 (images, top ${topOriginals.length} of ${brandOk.length} brand-matching)`
+        ),
+        enrichCandidates(top),
+    ]);
+
+    // Carry the detail fetched above (attached to `top`) onto the image-scored
+    // results the service returns, matched by sku.
+    const detailBySku = new Map(
+        top.filter((e) => e.detail !== undefined)
+           .map((e) => [String(e.product && e.product.sku), e.detail])
     );
+    for (const e of imageScored) {
+        const sku = String(e.product && e.product.sku);
+        if (detailBySku.has(sku)) e.detail = detailBySku.get(sku);
+    }
 
     // Image scores change the composite, so re-sort the merged list — the
     // callers take the FIRST candidate that clears, assuming best-first order.
@@ -874,7 +948,16 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
             let matchData = [];
             try {
-                matchData = await callMatchingService(sourceProduct, productBatches);
+                // The enrich callback fetches a candidate's product-page detail;
+                // callMatchingService runs these concurrently with the image pass
+                // and attaches the result to each top candidate as `.detail`.
+                matchData = await callMatchingService(
+                    sourceProduct, productBatches,
+                    (product) => enrichMatchedProduct(
+                        targetConfig, product, sourceProduct.sku,
+                        `candidate-${product && product.sku}`
+                    )
+                );
             } catch (error) {
                 console.log(error);
                 console.error("Error matching products:", error);
@@ -899,6 +982,18 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
             console.log("Match data found:", matchData.length);
 
+            // callMatchingService has already enriched the top N candidates
+            // (concurrently with the image pass) and attached `.detail` to each.
+            // Index them by sku so the winner below can reuse its detail rather
+            // than fetch the page a second time.
+            const detailBySku = new Map();
+            for (const cand of matchData) {
+                const candSku = cand && cand.product && cand.product.sku;
+                if (candSku != null && cand.detail !== undefined) {
+                    detailBySku.set(String(candSku), cand.detail);
+                }
+            }
+
             await appendToFile(matchedFilePath, {
                 sourceProduct: sourceProduct,
                 matchedProducts: matchData,
@@ -915,9 +1010,16 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
                     if (clearsMatchThreshold(matchData[i])) {
                         matchedEntry = matchData[i];
-                        const matchedDetail = await enrichMatchedProduct(
-                            targetConfig, matchData[i].product, sourceProduct.sku
-                        );
+                        // Reuse the detail already fetched in the top-N pass
+                        // when the winner is among them; only fetch here if the
+                        // winner fell outside the enriched top N.
+                        const winnerSku = matchData[i].product && matchData[i].product.sku;
+                        const matchedDetail = (winnerSku != null && detailBySku.has(String(winnerSku)))
+                            ? detailBySku.get(String(winnerSku))
+                            : await enrichMatchedProduct(
+                                targetConfig, matchData[i].product, sourceProduct.sku,
+                                `candidate-${winnerSku}`
+                            );
 
                         const finalObj = {
                             sourceProduct: sourceProduct,

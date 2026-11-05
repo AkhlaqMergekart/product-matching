@@ -674,6 +674,10 @@ const targetSites = {
     scraper: "axios",
     needsDetailFetch: false,
 
+    // Myntra fetches go through ScrapeOps FIRST (premium routing, 3 retries),
+    // only falling back to Webshare if all three fail. See fetchHtml().
+    scraperOptions: { scrapeOpsFirst: true },
+
     // Searched by brand + title rather than title alone. Myntra's relevance
     // ranking leans heavily on the brand token, and our source titles don't
     // always carry it.

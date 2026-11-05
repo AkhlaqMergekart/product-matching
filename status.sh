@@ -8,7 +8,7 @@ TOTAL=2852
 echo "===== $(date '+%Y-%m-%d %H:%M:%S') ====="
 
 echo "-- scripts --"
-pgrep -af "run-project.sh" | grep -v "bash -c" | sed 's/^/  /' || echo "  none running"
+pgrep -af "run-project" | grep -v "bash -c" | sed 's/^/  /' || echo "  none running"
 
 echo "-- progress --"
 for d in nykaafashion myntra; do

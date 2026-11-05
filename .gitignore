@@ -18,3 +18,13 @@ run_*.progress
 run_*.log
 html_cache/
 nohup.out
+
+# Local backups taken before in-place server edits
+*.bak
+*.bak-*
+# Consolidated/compressed run artefacts and emailed reports
+*.gz
+progress_report_*.txt
+progress_matches_*.csv
+# Server command log - contains vendor API keys
+server-run.txt
