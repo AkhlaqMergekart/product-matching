@@ -723,7 +723,30 @@ async function callMatchingService(originalProduct, comparableProducts, enrichFn
 
     // Image scores change the composite, so re-sort the merged list — the
     // callers take the FIRST candidate that clears, assuming best-first order.
-    return imageScored.concat(rest).sort((a, b) => (b.composite_score || 0) - (a.composite_score || 0));
+    const merged = imageScored
+        .concat(rest)
+        .sort((a, b) => (b.composite_score || 0) - (a.composite_score || 0));
+
+    // Top-up pass: guarantee the FINAL top N carry detail.
+    //
+    // The concurrent pass above enriches the top N by pass-1 text score (the
+    // brand-gated set that goes to the image pass). After this re-sort, a
+    // text-only candidate from `rest` can outrank an image-scored one and land
+    // inside the top N without detail — so the file's top N and the enriched
+    // set were not the same candidates (measured: only ~58% of top-N slots had
+    // detail). Enriching whatever is still missing keeps the overlap speedup
+    // while making the guarantee hold, and costs extra fetches only for the
+    // few candidates whose rank actually changed.
+    const missingDetail = merged
+        .slice(0, DETAIL_ENRICH_TOP_N)
+        .filter((e) => e.detail === undefined);
+
+    if (missingDetail.length) {
+        timing.logEvent(`Detail top-up: ${missingDetail.length} of the final top ${DETAIL_ENRICH_TOP_N} lacked detail after re-sort`);
+        await enrichCandidates(missingDetail);
+    }
+
+    return merged;
 }
 
 // Applies the "all four scores >= 0.85" rule (unchanged threshold) and
