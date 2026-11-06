@@ -474,7 +474,15 @@ function toText(value) {
 function withStringTextFields(product) {
     const copy = { ...product };
     for (const field of MATCH_TEXT_FIELDS) {
-        if (copy[field] != null && typeof copy[field] !== "string") {
+        if (copy[field] == null) {
+            // The service's schema types these as required strings, so a null
+            // value makes it reject the WHOLE request with HTTP 422 — and the
+            // caller writes an error row without a ledger outcome, so the
+            // product is silently dropped rather than recorded as unmatched.
+            // Project 353 has 555 rows with a null `title`, every one of which
+            // was lost this way. "" scores as "no text" instead of failing.
+            copy[field] = "";
+        } else if (typeof copy[field] !== "string") {
             copy[field] = toText(copy[field]);
         }
     }
