@@ -1,9 +1,12 @@
 const path = require("path");
+const cheerio = require("cheerio");
 const xpath = require("xpath");
 const { fetchJson } = require("../helper/httpClient.js");
 const { logEvent } = require("../helper/timingLogger.js");
 const spApi = require("../helper/spApiClient.js");
 const { searchFlipkart } = require("../helper/flipkartClient.js");
+const { searchGambol } = require("../helper/gambolClient.js");
+const { hasApiKey: hasScrapeOpsKey } = require("../helper/scrapeOpsClient.js");
 
 // config.json is the repo's home for deploy-time overrides (see
 // config/proxy.js); a missing file just means "use the defaults".
@@ -687,7 +690,66 @@ const targetSites = {
       },
     },
   },
+
+  // Gambol, a Shopify store (helper/gambolClient.js): its search page for the
+  // first page of products, then each product's JSON.
+  gambol: {
+    id: "gambol",
+    label: "Gambol",
+    searchApi: {
+      search: searchGambol,
+
+      checkReady() {
+        if (!hasScrapeOpsKey()) {
+          throw new Error("ScrapeOps API key is not configured (see helper/scrapeOpsClient.js).");
+        }
+      },
+
+      mapHit({ card, product }) {
+        const handle = product?.handle || card.handle;
+        const price = product ? round2(product.price / 100) : round2(card.price);
+
+        return {
+          url: `https://gambol.in/products/${encodeURIComponent(handle)}`,
+          category: product?.type || "",
+          brand: gambolBrand(product) || card.vendor,
+          title: product?.title || card.title,
+          // The Shopify product id: variant SKUs differ per size, and some
+          // products have none.
+          sku: String(product?.id || card.id),
+          price,
+          // Shopify prices are in paise; the card's are in rupees.
+          mrp: round2((product?.compare_at_price || 0) / 100) || price,
+          totalRating: "",
+          totalReview: "",
+          express: false,
+          description: gambolDescription(product?.description),
+          images: gambolImages(product, card),
+        };
+      },
+    },
+  },
 };
+
+// Gambol's vendor is often a sub-line ("Adidas Kids") while the brand itself
+// is in a "Brand_Adidas" tag, and brand is one of the four match gates.
+function gambolBrand(product) {
+  const tag = (product?.tags || []).find((t) => /^Brand_/i.test(t));
+  return tag ? tag.replace(/^Brand_/i, "").trim() : product?.vendor || "";
+}
+
+// Descriptions are the store's HTML. The space before each tag keeps words in
+// neighbouring blocks apart once the tags are gone.
+function gambolDescription(html) {
+  if (!html) return "";
+  return cheerio.load(html.replace(/</g, " <")).root().text().replace(/\s+/g, " ").trim();
+}
+
+// Image URLs come protocol-relative ("//gambol.in/cdn/shop/...").
+function gambolImages(product, card) {
+  const images = product?.images?.length ? product.images : card.image ? [card.image] : [];
+  return images.map((url) => (url.startsWith("//") ? `https:${url}` : url));
+}
 
 // First value of an SP-API attribute (attributes come as arrays of
 // { value, language_tag, marketplace_id }).

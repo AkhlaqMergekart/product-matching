@@ -453,12 +453,31 @@ function byCompositeScore(a, b) {
     return (b.composite_score || 0) - (a.composite_score || 0);
 }
 
+// The service's response strips `images`, so the JSON files would hold no
+// destination images at all. Puts back the full scraped list, not the
+// MAX_MATCH_IMAGES sent for comparison. Entries are matched on SKU.
+function restoreCandidateImages(matchData, comparableProducts) {
+    const imagesBySku = new Map(comparableProducts.map((candidate) => [String(candidate.sku), candidate.images]));
+
+    for (const entry of matchData) {
+        const images = imagesBySku.get(String(entry.product?.sku));
+        if (images) entry.product.images = images;
+    }
+
+    return matchData;
+}
+
+async function callMatchingService(originalProduct, comparableProducts) {
+    const matchData = await scoreCandidates(originalProduct, comparableProducts);
+    return restoreCandidateImages(matchData, comparableProducts);
+}
+
 // Scores every candidate on text, then compares images only for the best
 // IMAGE_SCORING_TOP_N that clear the brand threshold, in batches of
 // MATCHING_BATCH_SIZE. A candidate below that threshold can never be a match,
 // so its images are not worth comparing. Returns every candidate, best first;
 // those left out of the image pass keep their text-only scores.
-async function callMatchingService(originalProduct, comparableProducts) {
+async function scoreCandidates(originalProduct, comparableProducts) {
     originalProduct.price = originalProduct.price ? parseFloat(originalProduct.price) : 0;
     originalProduct.mrp = originalProduct.mrp ? parseFloat(originalProduct.mrp) : 0;
 
@@ -543,8 +562,11 @@ function pickBestMatch(matchData) {
 //   "amazon"    -> Amazon India's SP-API catalog search (needs the
 //                  AMAZON_SPAPI_* credentials, see helper/spApiClient.js).
 //   "flipkart"  -> Flipkart's search + serviceability APIs.
+//   "gambol"    -> Gambol's search page, then each product's Shopify JSON, all
+//                  through ScrapeOps (needs its API key, see
+//                  helper/scrapeOpsClient.js).
 // ---------------------------------------------------------------------------
-const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "amazon", "flipkart"];
+const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "amazon", "flipkart", "gambol"];
 
 async function productMatching(brands, projectId, category, destination = "nahdi") {
     try {
