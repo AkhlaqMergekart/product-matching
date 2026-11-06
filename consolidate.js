@@ -77,16 +77,61 @@ function collect(prefix) {
   return { out, files: files.length, skipped };
 }
 
+// Error rows are keyed by sku + reason, not sku alone: index.js writes one row
+// per failure reason, and a product can legitimately have more than one, while
+// a re-sent chunk must not duplicate the same pair.
+function collectErrors() {
+  const out = Object.fromEntries(DESTS.map((dest) => [dest, new Map()]));
+  const files = fs.readdirSync(".")
+    .filter((n) => new RegExp("^products_matching_errors_.*_" + PROJECT + "_\\d+\\.json$").test(n))
+    .map((n) => ({ n, t: Number(n.match(/_(\d+)\.json$/)[1]) }))
+    .sort((a, b) => a.t - b.t);
+
+  for (const f of files) {
+    const dest = destOf[String(f.t)];
+    if (!dest) continue;
+    let arr;
+    try { arr = JSON.parse(fs.readFileSync(f.n, "utf8")); } catch (e) { continue; }
+    for (const e of arr) {
+      const sku = e && e.sourceProduct && e.sourceProduct.sku;
+      if (sku == null) continue;
+      out[dest].set(String(sku) + "||" + String(e.error || ""), e);
+    }
+  }
+  return { out, files: files.length };
+}
+
+// Splits attachments into groups that each fit under the mail size limit, so
+// every file is delivered across several messages rather than the large ones
+// being dropped.
+function batchAttachments(list, limit) {
+  const batches = [];
+  let cur = [], curSize = 0;
+  for (const a of list) {
+    const size = fs.statSync(a.path).size;
+    if (curSize + size > limit && cur.length) { batches.push(cur); cur = []; curSize = 0; }
+    cur.push(a);
+    curSize += size;
+  }
+  if (cur.length) batches.push(cur);
+  return batches;
+}
+
 const raw = collect("products_matched");            // every scored candidate
 const fin = collect("products_matched_final");      // the winner (or {})
+const err = collectErrors();                        // every failure / non-match reason
 
 const attachments = [];
 const notes = [];
 notes.push(`Consolidated output - projectId ${PROJECT}`);
 notes.push(`Generated: ${new Date().toISOString()}`);
 notes.push("");
-notes.push(`Source chunk files: products_matched ${raw.files}, products_matched_final ${fin.files}`);
-notes.push(`De-duplicated by SKU per destination (newest chunk wins).`);
+notes.push(`Source chunk files: products_matched ${raw.files}, products_matched_final ${fin.files}, products_matching_errors ${err.files}`);
+notes.push(`De-duplicated by SKU per destination (newest chunk wins); errors by SKU + reason.`);
+notes.push("");
+notes.push(`NOTE on the errors file: it is not only hard failures. index.js writes every`);
+notes.push(`non-match there too, so "No matching products found" / "No products found"`);
+notes.push(`dominate. Genuine failures are "Max retries reached", HTTP and socket errors.`);
 notes.push(`Progress is shown as processed/total; ${TOTAL} is the expected total project SKU count.`);
 notes.push("");
 
@@ -94,7 +139,7 @@ for (const dest of DESTS) {
   const processed = progressCount(dest);
   notes.push(`  ${dest}: processed ${processed == null ? "not started" : `${processed}/${TOTAL}`}`);
 
-  for (const [label, src] of [["products_matched", raw], ["products_matched_final", fin]]) {
+  for (const [label, src] of [["products_matched", raw], ["products_matched_final", fin], ["products_matching_errors", err]]) {
     const rows = [...src.out[dest].values()];
     if (rows.length === 0) continue;
 
@@ -121,6 +166,19 @@ for (const dest of DESTS) {
   const f = fin.out[dest];
   const matched = [...f.values()].filter((e) => e.matchedProducts && Object.keys(e.matchedProducts).length > 0).length;
   notes.push(`  ${dest}: ${f.size} products in final, of which matched: ${matched}`);
+
+  // Reason breakdown, so the errors file can be read without opening it. The
+  // message is truncated because the HTTP 422 body carries every candidate SKU.
+  const reasons = {};
+  for (const e of err.out[dest].values()) {
+    const key = String(e.error || "?").slice(0, 70);
+    reasons[key] = (reasons[key] || 0) + 1;
+  }
+  const reasonRows = Object.entries(reasons).sort((a, b) => b[1] - a[1]);
+  if (reasonRows.length) {
+    notes.push(`  ${dest}: error reasons -`);
+    for (const [k, v] of reasonRows) notes.push(`      ${String(v).padStart(6)}  ${k}`);
+  }
   notes.push("");
 }
 
@@ -130,17 +188,31 @@ notes.push(`Total attachment size: ${(total / 1048576).toFixed(2)} MB`);
 (async () => {
   console.log(notes.join("\n"));
   if (attachments.length === 0) { console.log("nothing to attach"); return; }
-  if (total > GMAIL_LIMIT) {
-    console.log("\nATTACHMENTS EXCEED THE LIMIT IN TOTAL - sending the final files only");
-    for (let i = attachments.length - 1; i >= 0; i--) if (!/_final_/.test(attachments[i].filename)) attachments.splice(i, 1);
+
+  // Over the limit in total, send SEVERAL emails rather than dropping files.
+  // The previous behaviour kept only `_final_` attachments, which silently
+  // discarded both the candidates file and the errors file.
+  const batches = total > GMAIL_LIMIT
+    ? batchAttachments(attachments, GMAIL_LIMIT)
+    : [attachments];
+
+  if (batches.length > 1) {
+    console.log(`\nTotal ${(total / 1048576).toFixed(2)} MB exceeds the limit - sending ${batches.length} emails so every file is delivered`);
   }
-  await sendUpdateReportEmail({
-    from: config.FROM_EMAIL,
-    to: TO,
-    subject: `Consolidated product matching output - project ${PROJECT}`,
-    text: notes.join("\n"),
-    attachments,
-  });
-  console.log("\nemailed to " + TO);
-  console.log("attached: " + attachments.map((a) => a.filename).join(", "));
+
+  for (let i = 0; i < batches.length; i++) {
+    const part = batches.length > 1 ? ` (part ${i + 1} of ${batches.length})` : "";
+    await sendUpdateReportEmail({
+      from: config.FROM_EMAIL,
+      to: TO,
+      subject: `Consolidated product matching output - project ${PROJECT}${part}`,
+      // Only the first message carries the full notes; the rest just list files.
+      text: i === 0
+        ? notes.join("\n")
+        : `Continuation${part} of the consolidated output for project ${PROJECT}.\n\nAttached:\n` +
+          batches[i].map((a) => "  " + a.filename).join("\n"),
+      attachments: batches[i],
+    });
+    console.log(`emailed${part} to ${TO}: ` + batches[i].map((a) => a.filename).join(", "));
+  }
 })();
