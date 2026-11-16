@@ -1,5 +1,13 @@
 const path = require("path");
 const xpath = require("xpath");
+// Project 360's Puma rows carry their variation in the TITLE rather than in an
+// `attributes` blob, so the query builders for that target live in their own
+// helper alongside the parser they share.
+const {
+  buildPumaQuery,
+  buildPumaQueryWithoutColour,
+  stripTrademarks,
+} = require("../helper/pumaSourceTitle.js");
 
 // config.json is the repo's home for deploy-time overrides (see
 // config/proxy.js); a missing file just means "use the defaults".
@@ -1391,6 +1399,20 @@ const targetSites = {
     matchedDetail: {
       buildUrl: (candidate) => candidate.url || footlockerProductUrl(candidate),
 
+      // Stated explicitly so this keeps the behaviour it had when product
+      // pages were fetched with the search options: the PDP carries the SAME
+      // STATE_FROM_SERVER payload the listing does (read by the extractor
+      // below), so the marker is correct here and a response without it is a
+      // shell worth retrying. Without this entry the generic fallback would
+      // drop the marker and accept the shell.
+      scraperOptions: {
+        mustContain: "STATE_FROM_SERVER",
+        retryStatuses: [404],
+        headers: {
+          referer: "https://www.footlocker.com/",
+        },
+      },
+
       extract: (doc, url) => {
         const state = extractFootlockerState(doc);
         const data = footlockerDetailData(state);
@@ -1474,6 +1496,268 @@ const targetSites = {
     },
   },
 
+  // in.puma.com — the BRAND'S OWN site, which changes two things versus the
+  // marketplaces above.
+  //
+  // 1. The brand token is dropped from the query. Every product on the site is
+  //    Puma, so "PUMA" in the search box only dilutes relevance ranking (and
+  //    the source titles all begin with it). This is the one target that does
+  //    NOT use composeBrandTitleQuery. See helper/pumaSourceTitle.js.
+  //
+  // 2. The search returns ONE TILE PER COLOURWAY, not one per style. Searching
+  //    "Velocity NITRO 4 Shoes" on 2026-11-16 returned 24 tiles of which 6 were
+  //    the same style number (311141) in six different colours, each with its
+  //    own `data-product-id` ("311141_10"), its own image and its own price.
+  //    That is exactly the variation granularity project 360 needs, so the
+  //    colourway goes INTO the query and is also matched per-tile afterwards.
+  //
+  // Listing data comes from the server-rendered tile markup (the Next.js
+  // `__NEXT_DATA__` on the search page carries `pageProps: {emptyProps}` —
+  // results are fetched client-side — but the <li data-test-id=
+  // "product-list-item"> grid IS in the HTML). The PDP is richer: it ships
+  // both a ld+json Product/ProductGroup pair and a urql GraphQL cache whose
+  // `variations[]` carries every colourway with price, EAN and full gallery.
+  puma: {
+    id: "puma",
+    label: "Puma India",
+    scraper: "axios",
+    needsDetailFetch: false,
+
+    // Title + variation, brand stripped. Unlike every other target here this
+    // is NOT composeBrandTitleQuery; see the note above.
+    buildQuery: buildPumaQuery,
+
+    // Retry query for when the colourway costs us every hit: Puma's search is
+    // strict enough that an unrecognised colour name ("Alpine Snow") can
+    // return zero results for a product that is on the site. index.js falls
+    // back to this and matches the colour per-tile instead.
+    buildFallbackQuery: buildPumaQueryWithoutColour,
+
+    buildSearchUrl: (query) =>
+      `https://in.puma.com/in/en/search?q=${encodeURIComponent(query)}`,
+
+    scraperOptions: {
+      // The tile grid is the thing we parse; if it is absent the fetch was
+      // served a shell or a bot wall and is worth retrying rather than
+      // reporting as "no products found".
+      mustContain: "product-list-item",
+      headers: {
+        referer: "https://in.puma.com/in/en",
+      },
+    },
+
+    extractListingProducts: (doc) => {
+      const tiles = xpath.select("//*[@data-test-id='product-list-item']", doc);
+      if (!Array.isArray(tiles) || tiles.length === 0) return [];
+
+      return tiles
+        .map((tile) => {
+          const attr = (node, name) => {
+            const found = xpath.select1(`string(@${name})`, node);
+            return found == null ? "" : String(found);
+          };
+
+          // "311141_10" -> styleNumber 311141, colour swatch 10. This is the
+          // variation's identity on Puma and the only stable id on the tile.
+          const productId = attr(tile, "data-product-id");
+          const [styleNumber, colourValue] = productId.includes("_")
+            ? productId.split("_")
+            : [productId, ""];
+
+          const href = String(xpath.select1("string(.//a[@data-test-id='product-list-item-link']/@href)", tile) || "");
+          const url = href
+            ? (href.startsWith("http") ? href : `https://in.puma.com${href.startsWith("/") ? "" : "/"}${href}`)
+            : "";
+
+          // The link's aria-label is the only place the tile states its prices
+          // as plain numbers; the visible text carries them thousands-separated
+          // ("₹8,999"). Two shapes, discounted and not:
+          //   "6 Colors, <name>, Discounted Price, ₹8999, Regular price, ₹11999, -25%"
+          //   "<name>, Price, ₹11999"
+          const ariaLabel = String(xpath.select1("string(.//a[@data-test-id='product-list-item-link']/@aria-label)", tile) || "");
+          const prices = (ariaLabel.match(/₹\s*([0-9][0-9,]*)/g) || [])
+            .map((m) => round2(String(m).replace(/[₹,\s]/g, "")))
+            .filter((n) => n > 0);
+
+          const discounted = /discounted price/i.test(ariaLabel);
+          const price = prices.length ? prices[0] : 0;
+          // With a discount the second figure is the struck-through MRP; with
+          // a single price the MRP is the price.
+          const mrp = discounted && prices.length > 1 ? prices[1] : price;
+
+          // The tile's own text is "<n> ColorsNAMECOLOURWAY₹8,999₹11,999-25%"
+          // with no separators, so name and colour are read from the markup
+          // instead: the name sits in the aria-label between the colour count
+          // and the first price label, and the colourway is the img alt's
+          // second comma-separated field.
+          let title = ariaLabel
+            .replace(/^\s*\d+\s*Colors?\s*,\s*/i, "")
+            .replace(/,\s*(?:Discounted\s+Price|Regular\s+price|Price)\s*,.*$/i, "")
+            .trim();
+
+          const imgAlt = String(xpath.select1("string(.//img/@alt)", tile) || "");
+          // "Velocity NITRO™ 4 Women's Running Shoes, Sage Frost-Green Terrain, large-IND"
+          const altParts = imgAlt.split(",").map((s) => s.trim());
+          const colourName = altParts.length >= 2 ? altParts[1] : "";
+
+          if (!title && altParts.length) title = altParts[0];
+
+          // Cloudinary transform URLs. The tile serves a 300x300 thumbnail;
+          // the image service does better with the full-size render, so the
+          // w_/h_ pair is lifted to 2000 — the same size the PDP's ld+json
+          // uses, verified to answer 200 image/png.
+          const src = String(xpath.select1("string(.//img/@src)", tile) || "");
+          const fullSize = src
+            ? src.replace(/\bw_\d+,h_\d+\b/, "w_2000,h_2000")
+            : "";
+
+          return {
+            url,
+            category: "",
+            brand: "PUMA",
+            title: stripTrademarks(title),
+            // The variation-level id, which is what makes a candidate row here
+            // one COLOURWAY rather than one style.
+            sku: productId,
+            price,
+            mrp,
+            totalRating: "",
+            totalReview: "",
+            express: false,
+            description: colourName ? `Color: ${colourName}` : "",
+            images: fullSize ? [fullSize] : [],
+            // Carried for the variation match in index.js.
+            color: colourName,
+            styleNumber: String(styleNumber || ""),
+            colourValue: String(colourValue || ""),
+          };
+        })
+        .filter((p) => p.url && p.title);
+    },
+
+    // Fetched for the top candidates only. The PDP carries what the tile
+    // cannot: the description, the full image gallery, the EAN, and every
+    // sibling colourway with its own price — so the variation we actually hold
+    // can be priced even when the tile we matched was a different colour.
+    //
+    // Two payloads are read, in order of preference:
+    //   1. the urql GraphQL cache inside __NEXT_DATA__, whose `variations[]`
+    //      is the authoritative per-colourway list (verified 2026-11-16 on
+    //      /pd/velocity-nitro-4-womens-running-shoes/311141)
+    //   2. the ld+json Product + ProductGroup pair, as a fallback
+    //
+    // Sizes are NOT available from either: Puma renders its size buttons
+    // client-side and ships no size payload in the HTML. Recorded here so the
+    // absence is not mistaken for an extraction bug.
+    matchedDetail: {
+      buildUrl: (candidate) => candidate.url,
+
+      // The PRODUCT page's marker, not the search page's. The listing marker
+      // ("product-list-item") is absent from a PDP by definition, so without
+      // this the fetch layer would reject every correctly served product page.
+      // __NEXT_DATA__ is what both extractors below read from.
+      scraperOptions: {
+        mustContain: "__NEXT_DATA__",
+        headers: {
+          referer: "https://in.puma.com/in/en",
+        },
+      },
+
+      extract: (doc, url) => {
+        const gql = extractPumaGraphqlProduct(doc);
+        const ld = extractPumaLdProduct(doc);
+
+        if (!gql && !ld) return { url, error: "no product payload on the Puma product page" };
+
+        const product = gql || {};
+        const variations = Array.isArray(product.variations) ? product.variations : [];
+
+        // Which colourway this URL is actually showing: ?swatch=NN, else the
+        // ld+json Product's own colour, else the first variation.
+        //
+        // The fallback chain matters because a swatch that is not in
+        // `variations` means the page did not serve the colour we asked for
+        // (a delisted swatch redirects to the default), and silently reporting
+        // variation 01's price as that colour's price would be wrong. So the
+        // mismatch is recorded on the row rather than hidden.
+        const swatch = (String(url).match(/[?&]swatch=([^&]+)/) || [])[1] || "";
+        const bySwatch = swatch
+          ? variations.find((v) => String(v?.colorValue || "") === swatch)
+          : null;
+        const selected = bySwatch
+          || variations.find((v) => String(v?.colorName || "") === String(ld?.color || ""))
+          || variations[0]
+          || null;
+        const swatchResolved = Boolean(!swatch || bySwatch);
+
+        const offers = ld?.offers || {};
+        const strikethrough = offers?.priceSpecification?.price;
+
+        const images = selected && Array.isArray(selected.images)
+          ? selected.images.map((img) => img?.href).filter((h) => typeof h === "string" && h)
+          : (Array.isArray(ld?.image) ? ld.image.filter((h) => typeof h === "string" && h) : []);
+
+        return {
+          url,
+          sku: String(selected?.id || product.id || ld?.model || ""),
+          // Puma's EAN is the variation's barcode and the ld+json `sku`.
+          ean: String(selected?.ean || selected?.variantId || ld?.sku || ""),
+          styleNumber: String(selected?.masterId || product.id || ld?.model || ""),
+          title: stripTrademarks(product.name || ld?.name || ""),
+          brand: "PUMA",
+          rating: product.averageRating ? String(round2(product.averageRating)) : "",
+          ratingCount: product.amountOfReviews != null ? String(product.amountOfReviews) : "",
+          reviewCount: product.amountOfReviews != null ? String(product.amountOfReviews) : "",
+          // No size payload is served; see the note above.
+          size: "",
+          sizesAll: "",
+          images,
+          color: String(selected?.colorName || ld?.color || ""),
+          colourValue: String(selected?.colorValue || (swatchResolved ? swatch : "") || ""),
+          // False when the URL asked for a swatch the page does not offer, so
+          // the colour and price below belong to a DIFFERENT colourway than
+          // the one requested. Carried rather than silently absorbed.
+          requestedSwatch: swatch,
+          requestedSwatchResolved: swatchResolved,
+
+          // Every colourway of this style, each with its own price and URL.
+          // This is Puma's equivalent of Myntra's per-size `variants`: the
+          // thing that varies here is colour, not size.
+          variants: variations.map((v) => ({
+            size: "",
+            color: String(v?.colorName || ""),
+            colourValue: String(v?.colorValue || ""),
+            sku: String(v?.id || ""),
+            ean: String(v?.ean || v?.variantId || ""),
+            available: v?.orderable !== false,
+            price: round2(v?.salePrice ?? v?.productPrice ?? v?.price),
+            mrp: round2(v?.price ?? v?.productPrice),
+          })),
+
+          colourOptions: (Array.isArray(product.colors) ? product.colors : []).map((c) => ({
+            label: String(c?.name || "").trim(),
+            styleId: String(c?.value || ""),
+            url: product.id
+              ? `https://in.puma.com/in/en/pd/${productSlug(product.name || ld?.name || "")}/${product.id}?swatch=${encodeURIComponent(String(c?.value || ""))}`
+              : "",
+          })),
+
+          price: round2(selected?.salePrice ?? offers?.price ?? selected?.price),
+          mrp: round2(strikethrough ?? selected?.price ?? offers?.price),
+          description: htmlToText(product.description || ld?.description || ""),
+          descriptionHtml: product.description || ld?.description || "",
+          specifications: {
+            styleNumber: String(selected?.masterId || product.id || ""),
+            colour: String(selected?.colorName || ld?.color || ""),
+            gender: String(selected?.gender || ""),
+            materialComposition: htmlToText(selected?.materialComposition || ""),
+            sizeChartId: String(product.sizeChartId || ""),
+          },
+        };
+      },
+    },
+  },
+
   mumzworld: {
     id: "mumzworld",
     label: "Mumzworld",
@@ -1551,6 +1835,81 @@ const targetSites = {
     },
   },
 };
+
+// Puma's product page hydrates from a urql GraphQL cache that Next.js embeds
+// inside __NEXT_DATA__ as JSON *strings* — a blob per query, keyed by hash. The
+// one we want is whichever string parses to an object carrying
+// `product.variations`, which is the authoritative per-colourway list.
+//
+// Returns the inner `product` object, or null when no such blob is present
+// (a shell response, or a layout change), so the extractor can fall back to
+// ld+json rather than abort the source product.
+function extractPumaNextData(doc) {
+  for (const script of xpath.select("//script[@id='__NEXT_DATA__']", doc)) {
+    const text = script.textContent || "";
+    if (!text.trim()) continue;
+    try {
+      return JSON.parse(text);
+    } catch (err) {
+      continue;
+    }
+  }
+  return null;
+}
+
+function extractPumaGraphqlProduct(doc) {
+  const next = extractPumaNextData(doc);
+  if (!next) return null;
+
+  let found = null;
+
+  // Depth-first for a string-valued `data` key that mentions variations. The
+  // cache is nested several levels under props.pageProps.urqlState (the exact
+  // path has changed before), so the search is structural rather than keyed.
+  const walk = (node) => {
+    if (found || node === null || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (found) return;
+      if (key === "data" && typeof value === "string" && value.indexOf('"variations"') !== -1) {
+        try {
+          const parsed = JSON.parse(value);
+          const product = parsed?.product || parsed;
+          if (product && Array.isArray(product.variations)) {
+            found = product;
+            return;
+          }
+        } catch (err) {
+          // Not this blob; keep walking.
+        }
+      }
+      walk(value);
+    }
+  };
+
+  walk(next);
+  return found;
+}
+
+// The PDP ships two ld+json blocks: a `Product` for the colourway on screen
+// and a `ProductGroup` listing its siblings. The Product is the one with the
+// price and description.
+function extractPumaLdProduct(doc) {
+  for (const script of xpath.select("//script[@type='application/ld+json']", doc)) {
+    const text = script.textContent || "";
+    if (!text.trim()) continue;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && parsed["@type"] === "Product") return parsed;
+    } catch (err) {
+      continue;
+    }
+  }
+  return null;
+}
 
 // Prices in the index carry float noise (28.9996 for a 29.00 shelf price).
 function round2(value) {

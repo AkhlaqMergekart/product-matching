@@ -9,6 +9,7 @@ const { fetchHtml, closeFetchClients } = require("./helper/scrapeClient.js");
 const { fetchJson } = require("./helper/httpClient.js");
 const { exportResultsToExcel } = require("./helper/exportResults.js");
 const { withFetchableImages } = require("./helper/sourceImages.js");
+const { sourceSizeFromAsin } = require("./helper/pumaSourceTitle.js");
 const { saveHtml } = require("./helper/htmlCache.js");
 const timing = require("./helper/timingLogger.js");
 const targetSites = require("./config/targetSites.js");
@@ -50,7 +51,23 @@ const ScratchProducts = require("./models/scratchProducts.js");
 // candidates, because composite_score already weights brand — so this only
 // recovers matches that the hard gate was discarding, it does not loosen.
 const BRAND_MATCH_THRESHOLD = 0.30;
-const COMPOSITE_MATCH_THRESHOLD = 0.70;
+// Overridable because the reachable composite depends on what the SOURCE rows
+// carry, not only on how good the match is. The service's weights put 0.15 on
+// price and 0.30 on image_similarity (app/config/weights.py), so a project
+// whose rows have neither can never exceed 0.55 however perfect the match:
+//
+//   project 353 (Nahdi/Myntra/etc) -> rows carry price + images -> 0.70 is reachable
+//   project 360 Puma               -> price "Not Found" and images NULL on
+//                                     ALL 810 rows -> ceiling 0.550, so 0.70
+//                                     is unreachable BY ARITHMETIC and every
+//                                     product reports "no match" regardless of
+//                                     how well title and brand agree.
+//
+// Default unchanged at 0.70 so existing destinations behave exactly as before.
+// Set COMPOSITE_MATCH_THRESHOLD=0.45 (say) for a run over source rows that
+// have no price and no images. Whatever is used is recorded on every output
+// row under modelScore.thresholds, so a run stays interpretable later.
+const COMPOSITE_MATCH_THRESHOLD = parseFloat(process.env.COMPOSITE_MATCH_THRESHOLD || "0.70");
 
 // Secondary path. A candidate whose composite falls just short can still be a
 // match when the TITLE and the IMAGE both agree strongly — marketplaces rename
@@ -75,21 +92,111 @@ const RESCUE_BRAND_THRESHOLD = 0.80;
 // Used by BOTH flows below, so the legacy SKU-list path and the brand path
 // cannot drift apart on what counts as a match.
 function clearsMatchThreshold(entry) {
-    const fieldScores = entry && entry.field_scores;
-    if (!fieldScores) return false;
+    return matchDecision(entry).matched;
+}
 
-    if (fieldScores.brand >= BRAND_MATCH_THRESHOLD
-        && entry.composite_score >= COMPOSITE_MATCH_THRESHOLD) {
-        return true;
+// Why a candidate did or did not match, as data rather than a boolean.
+//
+// clearsMatchThreshold() answers "is this a match?" but throws away WHICH rule
+// decided and by how much, which is exactly what is needed when reviewing a
+// run: a composite of 0.699 rejected and one of 0.701 accepted look identical
+// in the output. `rule` is the rule that fired ("composite" | "rescue" |
+// null), and the thresholds are recorded alongside the scores so a row stays
+// interpretable after the constants above are retuned.
+function matchDecision(entry) {
+    const fieldScores = (entry && entry.field_scores) || null;
+    if (!fieldScores) {
+        return { matched: false, rule: null, reason: "no field_scores returned by the matching service" };
+    }
+
+    const composite = entry.composite_score || 0;
+    const brand = fieldScores.brand || 0;
+    const title = fieldScores.title || 0;
+    const image = fieldScores.image_similarity || 0;
+
+    if (brand >= BRAND_MATCH_THRESHOLD && composite >= COMPOSITE_MATCH_THRESHOLD) {
+        return { matched: true, rule: "composite", reason: `composite ${composite.toFixed(3)} >= ${COMPOSITE_MATCH_THRESHOLD} and brand ${brand.toFixed(3)} >= ${BRAND_MATCH_THRESHOLD}` };
     }
 
     // Note: image_similarity is only computed for the candidates that reach
     // the image pass (IMAGE_SCORING_TOP_N), so this path can only rescue
     // candidates already in the top N by text score — which is the right
     // population anyway.
-    return (fieldScores.title || 0) >= RESCUE_TITLE_THRESHOLD
-        && (fieldScores.image_similarity || 0) >= RESCUE_IMAGE_THRESHOLD
-        && (fieldScores.brand || 0) >= RESCUE_BRAND_THRESHOLD;
+    if (title >= RESCUE_TITLE_THRESHOLD && image >= RESCUE_IMAGE_THRESHOLD && brand >= RESCUE_BRAND_THRESHOLD) {
+        return { matched: true, rule: "rescue", reason: `title ${title.toFixed(3)}, image ${image.toFixed(3)}, brand ${brand.toFixed(3)} all cleared the rescue gates` };
+    }
+
+    // Name the gate that actually blocked it, most-informative first.
+    let reason;
+    if (brand < BRAND_MATCH_THRESHOLD) reason = `brand ${brand.toFixed(3)} < ${BRAND_MATCH_THRESHOLD}`;
+    else if (composite < COMPOSITE_MATCH_THRESHOLD) reason = `composite ${composite.toFixed(3)} < ${COMPOSITE_MATCH_THRESHOLD}`;
+    else reason = "no rule cleared";
+
+    return { matched: false, rule: null, reason };
+}
+
+// The model's scores, flattened into one object that travels with every row.
+//
+// The nested service response is already written to products_matched_, but
+// reading a score out of it means walking into matchedProducts.field_scores,
+// which is awkward in a spreadsheet and absent entirely on a non-match. This
+// is the flat, always-present form: every field score the service returned,
+// the composite, the image aggregate, and the decision that was taken.
+function modelScoreOf(entry) {
+    if (!entry || !entry.field_scores) {
+        return {
+            composite_score: null,
+            matched: false,
+            match_rule: null,
+            match_reason: "no candidate scored",
+            title: null, description: null, brand: null, price: null,
+            color: null, model: null, image_similarity: null,
+            average_image_similarity: null,
+            image_pairs_compared: 0,
+            thresholds: {
+                composite: COMPOSITE_MATCH_THRESHOLD,
+                brand: BRAND_MATCH_THRESHOLD,
+                rescue_title: RESCUE_TITLE_THRESHOLD,
+                rescue_image: RESCUE_IMAGE_THRESHOLD,
+                rescue_brand: RESCUE_BRAND_THRESHOLD,
+            },
+        };
+    }
+
+    const f = entry.field_scores;
+    const decision = matchDecision(entry);
+    const num = (v) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v * 10000) / 10000 : null);
+
+    return {
+        composite_score: num(entry.composite_score),
+        matched: decision.matched,
+        match_rule: decision.rule,
+        match_reason: decision.reason,
+        // The seven weighted fields, exactly as app/config/weights.py names
+        // them. Absent keys stay null rather than 0 — "not scored" and
+        // "scored zero" are different facts, and conflating them is what made
+        // the Foot Locker image diagnosis slow.
+        title: num(f.title),
+        description: num(f.description),
+        brand: num(f.brand),
+        price: num(f.price),
+        color: num(f.color),
+        model: num(f.model),
+        image_similarity: num(f.image_similarity),
+        // The service's own aggregate over every image pair it compared, and
+        // how many pairs that was — 0 means the image pass never ran for this
+        // candidate (it fell outside IMAGE_SCORING_TOP_N, or neither side had
+        // a usable image URL).
+        average_image_similarity: num(entry.average_image_similarity),
+        image_pairs_compared: Array.isArray(entry.raw_image_results) ? entry.raw_image_results.length : 0,
+        thresholds: {
+            composite: COMPOSITE_MATCH_THRESHOLD,
+            brand: BRAND_MATCH_THRESHOLD,
+            rescue_title: RESCUE_TITLE_THRESHOLD,
+            rescue_image: RESCUE_IMAGE_THRESHOLD,
+            rescue_brand: RESCUE_BRAND_THRESHOLD,
+        },
+    };
 }
 const MATCHING_SERVICE_URL = "http://localhost:8000/api/match";
 
@@ -144,6 +251,11 @@ function appendToFile(filename, data) {
 // survive exactly the crash it is there to recover from.
 //
 // JSONL, not JSON, for the same reason — no closing bracket to corrupt.
+// `extra.asin` should be passed wherever one is available: a project can hold
+// several VARIATION rows under one sku (project 360 keeps one row per size,
+// distinguished only by asin — 810 rows across 275 skus), and a resume that
+// keys on sku alone would skip every variation after the first. The runner
+// script prefers `asin` over `sku` when deciding what is already done.
 function recordProgress(projectId, destination, sku, outcome, extra) {
     try {
         const line = JSON.stringify(Object.assign({
@@ -486,7 +598,65 @@ function withStringTextFields(product) {
             copy[field] = toText(copy[field]);
         }
     }
+
+    // `price` is the other required field on the service's Product model
+    // (`price: Union[float, str]`), and a null or NaN there 422s the WHOLE
+    // batch exactly as a null title does. Candidates come from site
+    // extractors, which can yield either, so they are coerced here too — the
+    // source product is handled in callMatchingService, before this runs.
+    copy.price = toNumericPrice(copy.price);
+    if (copy.mrp != null && copy.mrp !== "") {
+        copy.mrp = toNumericPrice(copy.mrp);
+    }
+
     return copy;
+}
+
+// Which variation of its product a source row is — the identity that makes one
+// of project 360's duplicate-looking rows distinct from the next.
+//
+// 810 Puma rows share only 275 skus and 275 titles, because the project holds
+// one row PER SIZE and puts the size in `asin` rather than in the title or the
+// `size` column. `asin` is unique across all 810, so it is the variation key;
+// `size` here is its suffix (S/M/L/XL/XXL, 4-11, 128-176).
+//
+// Emitted on every output row so a consumer can tell the 7 size-rows of a shoe
+// apart, which is otherwise impossible from title + sku alone.
+function sourceVariationOf(sourceProduct) {
+    const size = sourceSizeFromAsin(sourceProduct);
+    return {
+        // The per-row unique key.
+        asin: String(sourceProduct?.asin ?? ""),
+        // The parent product; shared by every size of the same item.
+        sku: String(sourceProduct?.sku ?? ""),
+        size,
+        // False for accessories, whose asin is the bare sku with no suffix.
+        hasSize: Boolean(size),
+    };
+}
+
+// A price the matching service will accept: a finite number, never NaN, null
+// or undefined.
+//
+// Three separate things produce a value this has to absorb:
+//   - ScratchProducts stores unknown prices as the STRING "Not Found"
+//     (project 360: all 810 Puma rows), which parseFloat turns into NaN
+//   - JSON.stringify serialises NaN as `null`, which the service rejects with
+//     a 422 that fails the entire batch rather than the one field
+//   - site extractors occasionally yield "" or a currency-prefixed string
+//
+// 0 is the right fallback rather than omitting the field: the service scores
+// price similarity, and an unknown price should score 0 for that term instead
+// of discarding the candidate's title, brand and image agreement with it.
+function toNumericPrice(value) {
+    if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+    if (value == null) return 0;
+
+    // Strip currency symbols, thousands separators and spaces: "AED 1,299.00",
+    // "₹8,999", "Not Found".
+    const cleaned = String(value).replace(/[^0-9.]/g, "");
+    const n = parseFloat(cleaned);
+    return Number.isFinite(n) ? n : 0;
 }
 
 // Rewraps an axios failure so its message carries the service's own reason —
@@ -593,10 +763,24 @@ async function enrichMatchedProduct(targetConfig, matchedProduct, sourceSku, kin
     // (e.g. "candidate-<candidateSku>") or they overwrite one another.
     const cacheKind = kind || "matched-product";
 
+    // Product pages need their OWN fetch options, not the search page's.
+    // `scraperOptions.mustContain` is a search-page marker — Puma's is
+    // "product-list-item", the listing tile — and a product page legitimately
+    // does not contain it, so reusing it here rejects every correctly fetched
+    // PDP as a bad response and retries it to exhaustion. A target can state
+    // the product-page marker as `matchedDetail.scraperOptions`; otherwise the
+    // search options are used with `mustContain` dropped.
+    const detailOptions = cfg.scraperOptions
+        ? cfg.scraperOptions
+        : (() => {
+            const { mustContain, ...rest } = targetConfig.scraperOptions || {};
+            return rest;
+        })();
+
     try {
         const html = await timing.step(
             `${targetConfig.label} product page fetch`,
-            () => fetchHtml(targetConfig.scraper, url, targetConfig.scraperOptions),
+            () => fetchHtml(targetConfig.scraper, url, detailOptions),
             { detail: url, summarize: describeHtml }
         );
 
@@ -641,8 +825,20 @@ async function mapWithConcurrency(items, limit, fn) {
 // two slowest stages overlap instead of running back to back — and the detail is
 // attached to each candidate as `.detail`.
 async function callMatchingService(originalProduct, comparableProducts, enrichFn) {
-    originalProduct.price = originalProduct.price ? parseFloat(originalProduct.price) : 0;
-    originalProduct.mrp = originalProduct.mrp ? parseFloat(originalProduct.mrp) : 0;
+    // parseFloat of a non-numeric price yields NaN, and JSON.stringify turns
+    // NaN into `null` — which the service rejects outright, because `price` is
+    // `Union[float, str]` and therefore required:
+    //   loc: ["body","original_product","price","float"]  input: null  -> 422
+    //
+    // A 422 fails the WHOLE batch, so one unparseable source price discards
+    // every candidate for that product. Project 360 stores the literal string
+    // "Not Found" where a price is unknown — all 810 Puma rows — so every one
+    // of them failed this way until this guard was added.
+    //
+    // toNumericPrice keeps NaN out; the service itself is content with either
+    // a number or a numeric string, and scores an unknown price as 0.
+    originalProduct.price = toNumericPrice(originalProduct.price);
+    originalProduct.mrp = toNumericPrice(originalProduct.mrp);
 
     // Enriches the given candidates in parallel and attaches `.detail` to each.
     const enrichCandidates = async (candidates) => {
@@ -799,8 +995,14 @@ function pickBestMatch(matchData) {
 //               -> one search page per source product, searched by brand +
 //                  title, with every candidate read off that page's own
 //                  hydration JSON. First page of results only.
+//   "puma"      -> in.puma.com, the BRAND'S OWN site. Searched by title +
+//                  variation with the brand token REMOVED (every product there
+//                  is Puma), and its results are one tile per COLOURWAY rather
+//                  than one per style — so a candidate row is already a
+//                  specific variation. See config/targetSites.js and
+//                  helper/pumaSourceTitle.js.
 // ---------------------------------------------------------------------------
-const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "myntra", "nykaafashion", "footlocker"];
+const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "myntra", "nykaafashion", "footlocker", "puma"];
 
 async function productMatching(brands, projectId, category, destination = "nahdi") {
     try {
@@ -919,7 +1121,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                         sourceProduct: sourceProduct,
                         error: "Max retries reached"
                     });
-                    recordProgress(projectId, destination, sourceProduct.sku, "error", { error: "Max retries reached" });
+                    recordProgress(projectId, destination, sourceProduct.sku, "error", { asin: sourceProduct.asin, error: "Max retries reached" });
                     continue; // Skip to the next source product
                 } else {
                     x = x - 1; // Decrement x to retry the current source product
@@ -964,6 +1166,51 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                 }
             }
 
+            // A target can offer a broader second query for when the first
+            // returns nothing. Puma is the case this exists for: its search is
+            // strict enough that an unrecognised colour name ("Alpine Snow")
+            // returns zero hits for a product that is very much on the site,
+            // so the colourway is dropped and matched per-candidate instead.
+            //
+            // Only ever runs when the first query found NOTHING, so it costs
+            // one extra fetch on exactly the products that would otherwise
+            // have been written off as "No products found".
+            if (productBatches.length === 0
+                && !usesSearchApi
+                && typeof targetConfig.buildFallbackQuery === "function") {
+
+                const fallbackQuery = targetConfig.buildFallbackQuery(sourceProduct);
+
+                // Skip when it would repeat the query just tried (a source row
+                // with no colourway parsed out of its title).
+                if (fallbackQuery && fallbackQuery !== searchQuery) {
+                    timing.logEvent(`No candidates for "${searchQuery}" — retrying without the colourway: "${fallbackQuery}"`);
+                    const fallbackUrl = targetConfig.buildSearchUrl(fallbackQuery);
+
+                    try {
+                        const fallbackHtml = await timing.step(
+                            `${targetConfig.label} search page fetch (fallback query)`,
+                            () => fetchHtml(targetConfig.scraper, fallbackUrl, targetConfig.scraperOptions),
+                            { detail: fallbackUrl, summarize: describeHtml }
+                        );
+                        saveHtml(targetConfig.id, sourceProduct.sku, "search-fallback", fallbackUrl, fallbackHtml);
+
+                        const $fb = cheerio.load(fallbackHtml);
+                        const fbDoc = new dom().parseFromString($fb.xml(), 'text/xml');
+                        productBatches = await timing.step(
+                            `${targetConfig.label} candidate collection (fallback query)`,
+                            () => buildCandidatesFromDoc(targetConfig, fbDoc, fallbackQuery),
+                            { summarize: (c) => `${c.length} candidate(s)` }
+                        );
+                    } catch (err) {
+                        // The fallback is best-effort: a failure here leaves
+                        // the original "no products found" outcome intact
+                        // rather than turning it into a hard error.
+                        timing.logEvent(`  Fallback query failed — ${err.message}`);
+                    }
+                }
+            }
+
             if (productBatches.length === 0) {
                 console.log("No products found for:", sourceProduct.title);
                 timing.logEvent(`Result: no products found on ${targetConfig.label}`);
@@ -971,7 +1218,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                     sourceProduct: sourceProduct,
                     error: "No products found"
                 });
-                recordProgress(projectId, destination, sourceProduct.sku, "no-candidates", {});
+                recordProgress(projectId, destination, sourceProduct.sku, "no-candidates", { asin: sourceProduct.asin });
                 continue; // Skip to the next source product if no products found
             }
 
@@ -998,6 +1245,19 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                     error: error.message
                 });
 
+                // Record an outcome before moving on. Without this the product
+                // never reaches the ledger, so the resume logic treats it as
+                // never attempted and the run-project script hands it back on
+                // every pass — and, because the chunk waits on ledger growth,
+                // a batch of these stalls the loop for its full 30-minute
+                // timeout. This is the path that silently dropped 555 products
+                // of project 353 when a null title 422'd the batch.
+                recordProgress(projectId, destination, sourceProduct.sku, "error", {
+                    asin: sourceProduct.asin,
+                    error: error.message,
+                    candidates: productBatches.length,
+                });
+
                 continue; // Skip to the next source product if there's an error
             }
 
@@ -1007,7 +1267,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                     sourceProduct: sourceProduct,
                     error: "No match data found"
                 });
-                recordProgress(projectId, destination, sourceProduct.sku, "no-match-data", {});
+                recordProgress(projectId, destination, sourceProduct.sku, "no-match-data", { asin: sourceProduct.asin });
                 continue; // Skip to the next source product if no match data found
             }
 
@@ -1025,9 +1285,25 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                 }
             }
 
+            // Every scored candidate, each carrying a flat `modelScore` beside
+            // the service's nested response so the scores are readable without
+            // walking into field_scores. `rank` is the candidate's position
+            // after the image pass re-sorted them, which is the order that
+            // actually decided the winner.
+            //
+            // `sourceVariation` names WHICH variation row this is. Project 360
+            // holds one row per size and the rows of a product are otherwise
+            // identical — same sku, same title, same colourway — with the size
+            // only in `asin` ("10927703-7"). Without this the 7 size-rows of a
+            // shoe are indistinguishable in the output.
             await appendToFile(matchedFilePath, {
                 sourceProduct: sourceProduct,
-                matchedProducts: matchData,
+                sourceVariation: sourceVariationOf(sourceProduct),
+                matchedProducts: matchData.map((entry, rank) => ({
+                    ...entry,
+                    rank: rank + 1,
+                    modelScore: modelScoreOf(entry),
+                })),
             });
 
             let foundProductCount = 0;
@@ -1054,8 +1330,18 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
                         const finalObj = {
                             sourceProduct: sourceProduct,
+                            sourceVariation: sourceVariationOf(sourceProduct),
                             matchedProducts: matchData[i],
                             matchedDetail: matchedDetail,
+                            // The winner's scores, flat. Same shape as the
+                            // per-candidate modelScore above, so the final file
+                            // and the all-candidates file can be read the same
+                            // way.
+                            modelScore: modelScoreOf(matchData[i]),
+                            // Where the winner sat in the ranked list. Usually
+                            // 1, but the rescue rule can promote a candidate
+                            // the composite order put lower.
+                            matchedRank: i + 1,
                         };
 
                         await appendToFile(outputFilePath, finalObj);
@@ -1082,11 +1368,21 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             recordProgress(
                 projectId, destination, sourceProduct.sku,
                 foundProductCount === 0 ? "no-match" : "matched",
-                foundProductCount === 0 ? { candidates: productBatches.length } : {
+                foundProductCount === 0 ? {
+                    asin: sourceProduct.asin,
+                    size: sourceSizeFromAsin(sourceProduct),
+                    candidates: productBatches.length,
+                    // The best composite reached, so a near-miss is visible in
+                    // the ledger without opening the output files.
+                    bestComposite: matchData[0] ? (matchData[0].composite_score ?? null) : null,
+                } : {
+                    asin: sourceProduct.asin,
+                    size: sourceSizeFromAsin(sourceProduct),
                     candidates: productBatches.length,
                     matchedTitle: (matchedEntry && matchedEntry.product && matchedEntry.product.title) || "",
                     matchedUrl: (matchedEntry && matchedEntry.product && matchedEntry.product.url) || "",
-                    composite: matchedEntry ? matchedEntry.composite_score : null
+                    composite: matchedEntry ? matchedEntry.composite_score : null,
+                    matchRule: matchedEntry ? matchDecision(matchedEntry).rule : null,
                 }
             );
 
@@ -1098,9 +1394,26 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                     error: "No matching products found"
                 });
 
+                // A non-match still carries the BEST score that was achieved,
+                // which is the number that explains the outcome: "nothing
+                // matched" and "the best candidate reached 0.69 against a 0.70
+                // gate" are very different findings, and the second is
+                // invisible if only an empty object is written. matchData is
+                // sorted best-first, so [0] is the best candidate.
+                const best = matchData[0] || null;
+
                 await appendToFile(outputFilePath, {
                     sourceProduct: sourceProduct,
-                    matchedProducts: {}
+                    sourceVariation: sourceVariationOf(sourceProduct),
+                    matchedProducts: {},
+                    modelScore: modelScoreOf(best),
+                    bestCandidate: best && best.product ? {
+                        title: best.product.title || "",
+                        url: best.product.url || "",
+                        sku: best.product.sku || "",
+                        price: best.product.price ?? null,
+                    } : null,
+                    candidatesScored: matchData.length,
                 });
 
             } else {
