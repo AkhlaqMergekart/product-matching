@@ -10,6 +10,7 @@ const { fetchJson } = require("./helper/httpClient.js");
 const { exportResultsToExcel } = require("./helper/exportResults.js");
 const { withFetchableImages } = require("./helper/sourceImages.js");
 const { sourceSizeFromAsin } = require("./helper/pumaSourceTitle.js");
+const { parseTechnosportAsin, colourMatches, sizeIsAvailable } = require("./helper/technosportSourceTitle.js");
 const { saveHtml } = require("./helper/htmlCache.js");
 const timing = require("./helper/timingLogger.js");
 const targetSites = require("./config/targetSites.js");
@@ -622,16 +623,91 @@ function withStringTextFields(product) {
 //
 // Emitted on every output row so a consumer can tell the 7 size-rows of a shoe
 // apart, which is otherwise impossible from title + sku alone.
-function sourceVariationOf(sourceProduct) {
+function sourceVariationOf(sourceProduct, destination) {
+    const asin = String(sourceProduct?.asin ?? "");
+    const sku = String(sourceProduct?.sku ?? "");
+
+    // Technosport encodes BOTH axes: "<styleCode>-<colour>-<size>"
+    // ("W156-CF-MED", "B242-LGB-12Y") on all 433 rows of project 360, where
+    // Puma's carries the size alone ("10927703-7"). Parsing it as Puma's would
+    // read the size as "CF-MED" and lose the colour entirely, so the shape is
+    // chosen by destination rather than guessed from the string.
+    if (destination === "technosport") {
+        const v = parseTechnosportAsin(asin, sku);
+        return {
+            asin,
+            sku,
+            // Folded onto the destination's own labels (SML -> S, 08Y -> 8Y).
+            size: v.size,
+            // The source's abbreviation ("CF"); the destination states the full
+            // name ("Chili Flakes"), matched by colourMatches().
+            colourToken: v.colourToken,
+            hasSize: Boolean(v.size),
+            hasColour: Boolean(v.colourToken),
+        };
+    }
+
     const size = sourceSizeFromAsin(sourceProduct);
     return {
         // The per-row unique key.
-        asin: String(sourceProduct?.asin ?? ""),
+        asin,
         // The parent product; shared by every size of the same item.
-        sku: String(sourceProduct?.sku ?? ""),
+        sku,
         size,
         // False for accessories, whose asin is the bare sku with no suffix.
         hasSize: Boolean(size),
+    };
+}
+
+// Does this CANDIDATE represent the same variation as the source row?
+//
+// The matching service scores text and images; it knows nothing about whether
+// a candidate is the right COLOUR and the right SIZE. For a single-brand site
+// that returns one result per colourway, that is the question that actually
+// matters: "Women ... Tee - Black" and "Women ... Tee - Teal" score within
+// 0.01 of each other, so the composite cannot choose between them, but the
+// source row names exactly one of the two.
+//
+// Returns null for destinations where the source carries no variation axes, so
+// the field is simply absent rather than misleadingly false.
+function variationMatchOf(sourceVariation, candidate, destination) {
+    if (destination !== "technosport") return null;
+    if (!sourceVariation || !candidate) return null;
+
+    const wantColour = sourceVariation.colourToken || "";
+    const wantSize = sourceVariation.size || "";
+
+    const gotColour = candidate.color || "";
+    const sizes = Array.isArray(candidate.availableSizes) ? candidate.availableSizes : [];
+
+    // Colour: the source abbreviates ("CF"), the destination spells it out
+    // ("Chili Flakes"). colourMatches() only returns true on positive
+    // evidence, so `false` here means "not shown to be the same colour".
+    const colourOk = Boolean(wantColour && gotColour && colourMatches(wantColour, gotColour));
+
+    // Size: the candidate lists the sizes its colourway is sold in, already
+    // folded onto the same labels by parseTechnosportAsin (SML -> S).
+    // sizeIsAvailable, not an equality: kids sizes are RANGES on the
+    // destination ("7-8Y") against a single age in the source ("8Y").
+    const sizeOk = sizeIsAvailable(wantSize, sizes);
+
+    // The style code is the strongest signal of all — it is Technosport's own
+    // product id, so an equal code means the same product beyond doubt.
+    const wantCode = String(sourceVariation.sku || "").toUpperCase();
+    const gotCode = String(candidate.styleCode || "").toUpperCase();
+    const codeOk = Boolean(wantCode && gotCode && wantCode === gotCode);
+
+    return {
+        styleCodeMatch: codeOk,
+        colourMatch: colourOk,
+        sizeAvailable: sizeOk,
+        // All three agreeing is an exact variation hit: same product, same
+        // colourway, and the size we hold is actually sold in it.
+        exact: codeOk && colourOk && sizeOk,
+        wantColour,
+        gotColour,
+        wantSize,
+        availableSizes: sizes,
     };
 }
 
@@ -1001,8 +1077,17 @@ function pickBestMatch(matchData) {
 //                  than one per style — so a candidate row is already a
 //                  specific variation. See config/targetSites.js and
 //                  helper/pumaSourceTitle.js.
+//   "technosport"
+//               -> www.technosport.in, also the brand's own site and also
+//                  brand-stripped, but Mode S: its search page is a Next.js
+//                  shell that loads results client-side from UNBXD, so the
+//                  Unbxd index is queried directly. The query is the STYLE
+//                  CODE (the row's sku, and the last token of its title),
+//                  which Technosport indexes as masterProductCode and which
+//                  returns exactly that product's colourways. See
+//                  helper/technosportSourceTitle.js.
 // ---------------------------------------------------------------------------
-const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "myntra", "nykaafashion", "footlocker", "puma"];
+const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "myntra", "nykaafashion", "footlocker", "puma", "technosport"];
 
 async function productMatching(brands, projectId, category, destination = "nahdi") {
     try {
@@ -1296,13 +1381,38 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             // identical — same sku, same title, same colourway — with the size
             // only in `asin` ("10927703-7"). Without this the 7 size-rows of a
             // shoe are indistinguishable in the output.
+            const srcVariation = sourceVariationOf(sourceProduct, destination);
+
+            // The matching service ECHOES BACK only the fields its own Product
+            // model declares, so the variation fields a site extractor added —
+            // `color`, `styleCode`, `availableSizes` — are absent from
+            // `entry.product`. Matching against that echo therefore sees no
+            // colour at all and reports every candidate as a non-match.
+            //
+            // `productBatches` holds the candidates as the extractor built
+            // them, so the variation match is made against those, looked up by
+            // the sku that survives the round trip.
+            const originalBySku = new Map();
+            for (const cand of productBatches) {
+                if (cand && cand.sku != null) originalBySku.set(String(cand.sku), cand);
+            }
+            const originalOf = (product) => {
+                const key = product && product.sku != null ? String(product.sku) : "";
+                return originalBySku.get(key) || product;
+            };
+
             await appendToFile(matchedFilePath, {
                 sourceProduct: sourceProduct,
-                sourceVariation: sourceVariationOf(sourceProduct),
+                sourceVariation: srcVariation,
                 matchedProducts: matchData.map((entry, rank) => ({
                     ...entry,
                     rank: rank + 1,
                     modelScore: modelScoreOf(entry),
+                    // Which candidate is the RIGHT colour and size. The model
+                    // cannot tell two colourways of one product apart (their
+                    // titles differ by one word), so this is the field that
+                    // picks the variation the source row actually names.
+                    variationMatch: variationMatchOf(srcVariation, originalOf(entry.product), destination),
                 })),
             });
 
@@ -1330,9 +1440,12 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
                         const finalObj = {
                             sourceProduct: sourceProduct,
-                            sourceVariation: sourceVariationOf(sourceProduct),
+                            sourceVariation: srcVariation,
                             matchedProducts: matchData[i],
                             matchedDetail: matchedDetail,
+                            // Whether the WINNER is the right colour/size, not
+                            // merely the best-scoring text match.
+                            variationMatch: variationMatchOf(srcVariation, originalOf(matchData[i].product), destination),
                             // The winner's scores, flat. Same shape as the
                             // per-candidate modelScore above, so the final file
                             // and the all-candidates file can be read the same
@@ -1370,14 +1483,16 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                 foundProductCount === 0 ? "no-match" : "matched",
                 foundProductCount === 0 ? {
                     asin: sourceProduct.asin,
-                    size: sourceSizeFromAsin(sourceProduct),
+                    size: srcVariation.size,
+                    colourToken: srcVariation.colourToken || undefined,
                     candidates: productBatches.length,
                     // The best composite reached, so a near-miss is visible in
                     // the ledger without opening the output files.
                     bestComposite: matchData[0] ? (matchData[0].composite_score ?? null) : null,
                 } : {
                     asin: sourceProduct.asin,
-                    size: sourceSizeFromAsin(sourceProduct),
+                    size: srcVariation.size,
+                    colourToken: srcVariation.colourToken || undefined,
                     candidates: productBatches.length,
                     matchedTitle: (matchedEntry && matchedEntry.product && matchedEntry.product.title) || "",
                     matchedUrl: (matchedEntry && matchedEntry.product && matchedEntry.product.url) || "",
@@ -1404,7 +1519,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
                 await appendToFile(outputFilePath, {
                     sourceProduct: sourceProduct,
-                    sourceVariation: sourceVariationOf(sourceProduct),
+                    sourceVariation: srcVariation,
                     matchedProducts: {},
                     modelScore: modelScoreOf(best),
                     bestCandidate: best && best.product ? {

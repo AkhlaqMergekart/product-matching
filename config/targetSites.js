@@ -8,6 +8,13 @@ const {
   buildPumaQueryWithoutColour,
   stripTrademarks,
 } = require("../helper/pumaSourceTitle.js");
+// Technosport's rows encode the variation as "<styleCode>-<colour>-<size>" in
+// `asin`, and the style code is what their search engine indexes — so its
+// query builders live with the parser that reads that shape.
+const {
+  buildTechnosportQuery,
+  buildTechnosportFallbackQuery,
+} = require("../helper/technosportSourceTitle.js");
 
 // config.json is the repo's home for deploy-time overrides (see
 // config/proxy.js); a missing file just means "use the defaults".
@@ -1752,6 +1759,161 @@ const targetSites = {
             gender: String(selected?.gender || ""),
             materialComposition: htmlToText(selected?.materialComposition || ""),
             sizeChartId: String(product.sizeChartId || ""),
+          },
+        };
+      },
+    },
+  },
+
+  // www.technosport.in — the BRAND'S OWN site, like Puma, so the brand token
+  // is again removed from the query. Everything else about it is different.
+  //
+  // Mode S (searchApi). The /search-result?q= page is a Next.js App Router
+  // shell that ships "Loading products…" and `animate-pulse` skeleton divs —
+  // the ten `.product-item` elements in the HTML are placeholders, and the real
+  // results are fetched client-side from UNBXD. So there is nothing to scrape
+  // off the page; the Unbxd index is queried directly instead, which also means
+  // one request per product with no page-per-candidate fetching.
+  //
+  // The query is the STYLE CODE, not the title. Technosport indexes its own
+  // internal code as `masterProductCode`, and the code is both the row's `sku`
+  // and the last token of its title. Verified across all 52 distinct codes of
+  // project 360 on 2026-11-16:
+  //
+  //   codes whose results are ALL on-code : 50 / 52
+  //   codes returning a MIX of products   :  0
+  //   codes returning nothing (delisted)  :  2  (B228, B231)
+  //
+  // Searching "W156" returns exactly its 8 colourways, each with its own
+  // colour, price and image. The title by contrast is generic — "Boys Track
+  // Pant" returns 65+ unrelated garments — so it is kept only as the fallback
+  // query for the two delisted codes, where same-category candidates are
+  // better than reporting "no products found".
+  technosport: {
+    id: "technosport",
+    label: "TechnoSport",
+    scraper: "axios",
+    needsDetailFetch: false,
+
+    // Style code (see above). Brand token stripped: every product on
+    // technosport.in is Technosport.
+    buildQuery: buildTechnosportQuery,
+    // Descriptive title, brand and code removed — recovers a delisted code.
+    buildFallbackQuery: buildTechnosportFallbackQuery,
+
+    // Only used for the human-readable log line and for `sourceUrl`; the
+    // candidates come from the Unbxd API below, not from this page.
+    buildSearchUrl: (query) =>
+      `https://www.technosport.in/search-result?q=${encodeURIComponent(query)}`,
+
+    searchApi: {
+      // Unbxd site key and API key, both NEXT_PUBLIC_* values the storefront
+      // ships to every visitor in its own JS bundle
+      // (_next/static/chunks/*.js -> runtimeEnv). They are the public,
+      // search-only kind, exactly like Mumzworld's Algolia key above.
+      //
+      // If Technosport rotates them, searches start failing: read the new
+      // values out of NEXT_PUBLIC_UNBXD_SITE_KEY / NEXT_PUBLIC_UNBXD_API_KEY
+      // in that bundle and set TECHNOSPORT_UNBXD_SITE_KEY /
+      // TECHNOSPORT_UNBXD_API_KEY (env) or the config.json equivalents — no
+      // code change needed.
+      baseUrl: "https://search.unbxd.io",
+      siteKey: process.env.TECHNOSPORT_UNBXD_SITE_KEY
+        || fileConfig.TECHNOSPORT_Unbxd_Site_Key
+        || "ss-unbxd-aapac-prod-technosport80021787234497",
+      apiKey: process.env.TECHNOSPORT_UNBXD_API_KEY
+        || fileConfig.TECHNOSPORT_Unbxd_Api_Key
+        || "15bad5f6c823712093ac03b5176f1be6",
+      // A style code yields at most ~12 colourways; the fallback title query
+      // can return 100+, so this caps what the matching service is asked to
+      // score. Same order of magnitude as the other targets' first page.
+      rows: 30,
+
+      buildUrl(query) {
+        return `${this.baseUrl}/${this.apiKey}/${this.siteKey}/search`
+          + `?q=${encodeURIComponent(query)}&rows=${this.rows}`;
+      },
+
+      headers() {
+        return {
+          accept: "application/json",
+          referer: "https://www.technosport.in/",
+          origin: "https://www.technosport.in",
+        };
+      },
+
+      extractHits: (response) => {
+        const products = response?.response?.products;
+        return Array.isArray(products) ? products : [];
+      },
+
+      mapHit: (hit) => {
+        // Unbxd returns most fields as single-element ARRAYS (color, brand,
+        // category, imageUrl, size), so each is unwrapped rather than
+        // stringified — JSON.stringify of ["Black"] would score as '["black"]'.
+        const first = (value) => (Array.isArray(value) ? value[0] : value);
+        const all = (value) => (Array.isArray(value) ? value : value == null ? [] : [value]);
+
+        const colour = String(first(hit.color) || first(hit.colorFamily1) || "").trim();
+        const name = String(hit.title || hit.autosuggest || "").trim();
+
+        // productUrl is relative with a leading slash and a ?preferred_size
+        // query ("/products/<slug>/13696?preferred_size=S").
+        const path = String(hit.productUrl || "").trim();
+        const url = path
+          ? `https://www.technosport.in${path.startsWith("/") ? "" : "/"}${path}`
+          : (hit.variantSlug ? `https://www.technosport.in/products/${hit.variantSlug}` : "");
+
+        // sellingPrice is what the shopper pays; price is the MRP it is struck
+        // through against. Both are plain numbers here, unlike the storefront's
+        // "₹8,999" text.
+        const selling = round2(hit.sellingPrice ?? hit.price);
+        const mrp = round2(hit.price ?? hit.sellingPrice) || selling;
+
+        return {
+          url,
+          // "Women > T-Shirts", matching the path shape the other targets build.
+          category: [first(hit.category), first(hit.subCategory) || first(hit.product_type)]
+            .filter((part) => part && String(part).trim())
+            .join(" > "),
+          // The destination writes "Techno Sport" (two words) where the source
+          // writes "Technosport". Normalised so the service's brand score is
+          // 1.000 rather than a partial, which would drag the composite down
+          // for every candidate on a single-brand site.
+          brand: "Technosport",
+          // The colour is appended because Unbxd's `title` is the same string
+          // for all eight colourways of a product — without it every candidate
+          // is textually identical and the colour carries no weight at all.
+          title: colour ? `${name} - ${colour}` : name,
+          // The VARIATION's own id: style + colour + size ("WTW156BLKSML"),
+          // falling back to Unbxd's uniqueId ("W156_13696").
+          sku: String(hit.skuCode || hit.uniqueId || hit.unbxdProductId || ""),
+          price: selling,
+          mrp,
+          totalRating: "",
+          totalReview: "",
+          express: false,
+          description: htmlToText(hit.description || ""),
+          images: all(hit.imageUrl).filter((u) => typeof u === "string" && u.trim()),
+
+          // Carried for the variation match in index.js. These are what make a
+          // Technosport candidate matchable at variation level, which is the
+          // point of the project-360 run.
+          color: colour,
+          styleCode: String(first(hit.masterProductCode) || "").trim(),
+          availableSizes: all(hit.availablesize).map((s) => String(s).trim()).filter(Boolean),
+          inStock: String(hit.inventoryStatus || "") === "IN_STOCK",
+          specifications: {
+            styleCode: String(first(hit.masterProductCode) || "").trim(),
+            colour,
+            fit: String(hit.fitType || "").trim(),
+            fabricTech: String(hit.fabricTech || "").trim(),
+            neckType: String(first(hit.neckType) || "").trim(),
+            sleeveType: String(hit.sleeveType || "").trim(),
+            sizes: all(hit.availablesize).join(", "),
+            barcode: String(hit.barcode || "").trim(),
+            careInstructions: String(hit.msCareInstructions || "").trim(),
+            suitableFor: all(hit.msSuitableFor).join(", "),
           },
         };
       },
