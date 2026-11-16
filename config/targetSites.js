@@ -15,6 +15,12 @@ const {
   buildTechnosportQuery,
   buildTechnosportFallbackQuery,
 } = require("../helper/technosportSourceTitle.js");
+// Speedo's style code is not searchable but IS the tail of every product
+// handle, and its titles lead with an audience code the storefront spells out.
+const {
+  buildSpeedoQuery,
+  buildSpeedoFallbackQuery,
+} = require("../helper/speedoSourceTitle.js");
 
 // config.json is the repo's home for deploy-time overrides (see
 // config/proxy.js); a missing file just means "use the defaults".
@@ -1914,6 +1920,241 @@ const targetSites = {
             barcode: String(hit.barcode || "").trim(),
             careInstructions: String(hit.msCareInstructions || "").trim(),
             suitableFor: all(hit.msSuitableFor).join(", "),
+          },
+        };
+      },
+    },
+  },
+
+  // www.speedo.in — the brand's own site again (so the brand token is stripped
+  // from the query), on SHOPIFY, which makes it Mode S via Shopify's own
+  // predictive-search JSON. Everything else differs from Puma/Technosport.
+  //
+  // THE STYLE CODE IS NOT SEARCHABLE, unlike Technosport's. Speedo's search
+  // returns ZERO results for "812411012" and for every truncation of it. But
+  // the code IS the tail of every product handle:
+  //   boys-endurance10-medley-gala-logo-jammer-dark-teal-...-812411012
+  // so it is the VERIFICATION key rather than the query — identity is provable
+  // (see styleCodeInHandle) while the query has to be the title.
+  //
+  // THE TITLE NEEDS ITS AUDIENCE CODE EXPANDED. The source writes
+  // "JM MEDLEY JAMMER"; Speedo lists "Boy's Endurance10 Medley Gala Logo
+  // Jammer". Measured against the live index:
+  //   "JM MEDLEY JAMMER"    -> 10 results, target MISSING
+  //   "Boy's MEDLEY JAMMER" -> 10 results, target at RANK 6
+  // See helper/speedoSourceTitle.js for the mapping and for why JET/SEA/FUTURA
+  // are NOT treated as codes (stripping "JET" cost a rank-2 hit).
+  //
+  // Sizes are NOT in the search payload (`variants: []` there), so the product
+  // page's own .js is fetched for the top candidates — that is where the five
+  // size variants, their availability and the full gallery live.
+  speedo: {
+    id: "speedo",
+    label: "Speedo India",
+    scraper: "axios",
+    needsDetailFetch: false,
+
+    // Speedo rate-limits its product JSON endpoint hard. At the shared default
+    // of 5 concurrent detail fetches, a 20-row test drew HTTP 429 thirty-four
+    // times and each row cost ~15s in retries instead of ~1s. Measured, not
+    // guessed. 2 keeps it under the limit; the ScrapeOps fallback still covers
+    // the occasional miss.
+    detailFetchConcurrency: 2,
+
+    // Title with the brand removed and the audience code expanded.
+    buildQuery: buildSpeedoQuery,
+    // Model name only, for when Shopify's AND-ing of a long title returns
+    // nothing ("JUNIOR HYDROSITY 2.0 PINK/BLUE" -> 0 results, "HYDROSITY 2.0"
+    // -> target at rank 4).
+    buildFallbackQuery: buildSpeedoFallbackQuery,
+
+    // Only for the log line; candidates come from the searchApi below.
+    buildSearchUrl: (query) =>
+      `https://www.speedo.in/search?q=${encodeURIComponent(query)}`,
+
+    searchApi: {
+      // Shopify's built-in predictive search. No key: it is the same endpoint
+      // the site's own search box calls, and it is public on every Shopify
+      // store. speedo.in answers a direct (unproxied) request with 403, so
+      // fetchJson's proxy + ScrapeOps fallback is doing real work here.
+      limit: 20,
+
+      buildUrl(query) {
+        return `https://www.speedo.in/search/suggest.json?q=${encodeURIComponent(query)}`
+          + `&resources[type]=product&resources[limit]=${this.limit}`;
+      },
+
+      headers() {
+        return {
+          accept: "application/json",
+          referer: "https://www.speedo.in/",
+          origin: "https://www.speedo.in",
+        };
+      },
+
+      extractHits: (response) => {
+        const products = response?.resources?.results?.products;
+        return Array.isArray(products) ? products : [];
+      },
+
+      mapHit: (hit) => {
+        const handle = String(hit?.handle || "").trim();
+        // `url` carries Shopify's search-tracking query string
+        // (?_pos=1&_psq=...), which is noise in an output file and would make
+        // the same product look like different URLs across runs.
+        const path = String(hit?.url || "").split("?")[0]
+          || (handle ? `/products/${handle}` : "");
+        const url = path ? `https://www.speedo.in${path.startsWith("/") ? "" : "/"}${path}` : "";
+
+        // suggest.json prices are already rupee strings ("1399.00"), unlike
+        // the product .js endpoint which uses paise integers (139900).
+        const price = round2(hit?.price);
+        const mrp = round2(hit?.compare_at_price_max ?? hit?.price) || price;
+
+        return {
+          url,
+          // tags carry the taxonomy ("Boys Swimwear", "Jammers"); `type` is
+          // the leaf. Joined as a path like the other targets build.
+          category: [
+            (Array.isArray(hit?.tags) ? hit.tags.find((t) => /swimwear|swimsuit|accessor/i.test(String(t))) : "") || "",
+            String(hit?.type || "").trim(),
+          ].filter((part) => part && String(part).trim()).join(" > "),
+          // `vendor` is the literal string "Speedo.in", which would score as a
+          // partial brand match against the source's "Speedo" and drag every
+          // candidate's composite down on a single-brand site.
+          brand: "Speedo",
+          title: String(hit?.title || "").trim(),
+          // Shopify's numeric product id. The STYLE CODE is in the handle, and
+          // is carried separately below for the variation match.
+          sku: String(hit?.id || handle),
+          price,
+          mrp,
+          totalRating: "",
+          totalReview: "",
+          express: false,
+          description: htmlToText(hit?.body || ""),
+          images: [hit?.featured_image?.url || hit?.image]
+            .filter((u) => typeof u === "string" && u.trim()),
+
+          // Carried for the variation match in index.js.
+          handle,
+          // suggest.json ships `variants: []` — the real size list comes from
+          // the product page (matchedDetail below), so this stays empty here
+          // rather than implying none exist.
+          availableSizes: [],
+          inStock: hit?.available !== false,
+          specifications: {
+            handle,
+            productType: String(hit?.type || "").trim(),
+            tags: (Array.isArray(hit?.tags) ? hit.tags : []).join(", "),
+            vendor: String(hit?.vendor || "").trim(),
+          },
+        };
+      },
+    },
+
+    // Fetched for the top candidates only. Shopify's /products/<handle>.js is
+    // the cheapest complete product payload on any Shopify store — one small
+    // JSON with every variant, its availability and the full gallery. Verified
+    // live 2026-11-16 on .../jammer-...-812411012: 5 variants, 12 images.
+    matchedDetail: {
+      // `.json`, NOT `.js`. The two serve the same product payload, but only
+      // `.js` sits behind the anti-bot layer: every `.js` fetch came back 403
+      // through the proxy AND as a 15-byte anti-bot page through ScrapeOps,
+      // while `.json` returns the full product with its 5 size variants.
+      // Verified live 2026-11-16 on the same handle.
+      buildUrl: (candidate) => {
+        const handle = candidate?.handle
+          || String(candidate?.url || "").split("?")[0].split("/products/")[1];
+        return handle ? `https://www.speedo.in/products/${handle}.json` : "";
+      },
+
+      // The response is JSON, not HTML, so this target asks for it to be
+      // parsed as JSON rather than run through the XML/cheerio path the
+      // HTML-scraping targets use (which would mangle it into a DOM).
+      expectJson: true,
+
+      scraperOptions: {
+        headers: {
+          accept: "application/json",
+          referer: "https://www.speedo.in/",
+          origin: "https://www.speedo.in",
+        },
+      },
+
+      extract: (doc, url) => {
+        // With expectJson the "doc" IS the parsed response. The `.json`
+        // endpoint wraps the product under a `product` key (the `.js` one does
+        // not), so unwrap defensively.
+        const p = doc?.product || doc;
+        if (!p || !p.id) return { url, error: "no Shopify product payload" };
+
+        const variants = Array.isArray(p.variants) ? p.variants : [];
+
+        // `.json` money fields are RUPEE-DECIMAL STRINGS ("1399.00"), unlike
+        // the `.js` endpoint's paise integers (139900). Dividing by 100 here —
+        // as the first draft did for `.js` — would report every price as
+        // Rs 13.99. round2 parses the string directly.
+        const money = (v) => round2(v);
+
+        // `.json` omits `available` entirely (it is undefined on every
+        // variant), where `.js` sets a boolean. So availability is UNKNOWN
+        // here, not false: `inventory_quantity`/`available` are only exposed
+        // to authenticated Admin API calls. Reported as null rather than
+        // guessing "in stock", which would be a claim the payload cannot back.
+        const availabilityOf = (v) => (typeof v?.available === "boolean" ? v.available : null);
+
+        const sizeLabels = variants.map((v) => String(v.title || "").trim()).filter(Boolean);
+
+        return {
+          url,
+          sku: String(p.id || ""),
+          handle: String(p.handle || ""),
+          title: String(p.title || ""),
+          brand: "Speedo",
+          rating: "",
+          ratingCount: "",
+          reviewCount: "",
+          // Every size Speedo lists, as it writes them: "24 (5-6Y)", "32", "S".
+          // Not filtered by availability, because this payload does not state
+          // it — see availabilityOf above.
+          size: sizeLabels.join(", "),
+          sizesAll: sizeLabels.join(", "),
+          images: (Array.isArray(p.images) ? p.images : [])
+            .map((i) => (typeof i === "string" ? i : i?.src))
+            .filter((u) => typeof u === "string" && u)
+            .map((u) => (u.startsWith("//") ? `https:${u}` : u)),
+          color: "",
+
+          // Per-size pricing — the point of fetching this page. A Shopify
+          // variant can be priced differently from its parent.
+          variants: variants.map((v) => ({
+            size: String(v.title || "").trim(),
+            sku: String(v.sku || ""),
+            available: availabilityOf(v),
+            price: money(v.price),
+            mrp: money(v.compare_at_price ?? v.price),
+          })),
+          colourOptions: [],
+
+          // `.json` carries no product-level price; the variants do. The
+          // minimum is the shelf price the storefront shows.
+          price: variants.length
+            ? Math.min(...variants.map((v) => money(v.price)).filter((n) => n > 0))
+            : 0,
+          mrp: variants.length
+            ? Math.max(...variants.map((v) => money(v.compare_at_price ?? v.price)).filter((n) => n > 0))
+            : 0,
+          description: htmlToText(p.body_html || p.description || ""),
+          descriptionHtml: p.body_html || p.description || "",
+          specifications: {
+            productType: String(p.product_type || p.type || "").trim(),
+            tags: Array.isArray(p.tags) ? p.tags.join(", ") : String(p.tags || ""),
+            vendor: String(p.vendor || "").trim(),
+            sizeOption: (Array.isArray(p.options) ? p.options : [])
+              .map((o) => `${o?.name}: ${(Array.isArray(o?.values) ? o.values : []).join(" / ")}`)
+              .join(" | "),
+            publishedAt: String(p.published_at || ""),
           },
         };
       },

@@ -11,6 +11,7 @@ const { exportResultsToExcel } = require("./helper/exportResults.js");
 const { withFetchableImages } = require("./helper/sourceImages.js");
 const { sourceSizeFromAsin } = require("./helper/pumaSourceTitle.js");
 const { parseTechnosportAsin, colourMatches, sizeIsAvailable } = require("./helper/technosportSourceTitle.js");
+const { parseSpeedoAsin, styleCodeInHandle } = require("./helper/speedoSourceTitle.js");
 const { saveHtml } = require("./helper/htmlCache.js");
 const timing = require("./helper/timingLogger.js");
 const targetSites = require("./config/targetSites.js");
@@ -647,6 +648,25 @@ function sourceVariationOf(sourceProduct, destination) {
         };
     }
 
+    // Speedo appends the size to the sku with NO separator
+    // ("81241101224" = "812411012" + "24"), so neither Puma's
+    // last-hyphen-segment rule nor Technosport's three-part split applies —
+    // the sku has to be stripped by prefix.
+    if (destination === "speedo") {
+        const v = parseSpeedoAsin(asin, sku);
+        return {
+            asin,
+            sku,
+            // "04Y" normalised to "4Y"; numeric sizes (22-48) left as written.
+            size: v.size,
+            hasSize: v.hasSize,
+            // 62 of the 313 rows are one-size items (caps, goggles, earplugs)
+            // whose asin IS the bare sku. Stated so an absent size reads as
+            // "this product has no size" rather than a parse failure.
+            oneSize: !v.hasSize,
+        };
+    }
+
     const size = sourceSizeFromAsin(sourceProduct);
     return {
         // The per-row unique key.
@@ -671,8 +691,74 @@ function sourceVariationOf(sourceProduct, destination) {
 // Returns null for destinations where the source carries no variation axes, so
 // the field is simply absent rather than misleadingly false.
 function variationMatchOf(sourceVariation, candidate, destination) {
-    if (destination !== "technosport") return null;
     if (!sourceVariation || !candidate) return null;
+
+    // Speedo: identity comes from the STYLE CODE IN THE HANDLE, not from a
+    // field. Its search cannot find the code, but every product URL ends with
+    // it ("...-jammer-dark-teal-812411012"), so a handle containing the
+    // source's sku is proof of the same product.
+    //
+    // Size is matched against the candidate's VARIANT list, which only exists
+    // after the product page has been fetched (suggest.json ships
+    // `variants: []`). Until then `sizeAvailable` is null — unknown, not false.
+    if (destination === "speedo") {
+        const wantSize = sourceVariation.size || "";
+        const codeOk = styleCodeInHandle(sourceVariation.sku, candidate);
+
+        // Speedo writes sizes as "24 (5-6Y)" — a numeric size plus an age
+        // range — so a bare "24" has to match on the leading token rather than
+        // the whole label.
+        //
+        // The sizes come from the DETAIL payload, not the search payload:
+        // suggest.json ships `variants: []`, so `candidate.availableSizes` is
+        // always empty and reading only that reported "size unknown" for every
+        // candidate even after the product JSON had been fetched successfully.
+        const detailSizes = (() => {
+            const fromSearch = Array.isArray(candidate.availableSizes) ? candidate.availableSizes : [];
+            if (fromSearch.length) return fromSearch;
+            const d = candidate.detail;
+            if (d && !d.error) {
+                if (Array.isArray(d.variants) && d.variants.length) {
+                    return d.variants.map((v) => String(v.size || "").trim()).filter(Boolean);
+                }
+                if (d.sizesAll) return String(d.sizesAll).split(",").map((s) => s.trim()).filter(Boolean);
+            }
+            return [];
+        })();
+        const sizeOk = detailSizes.length === 0
+            ? null
+            : detailSizes.some((label) => {
+                const l = String(label).trim().toUpperCase();
+                const w = wantSize.toUpperCase();
+                if (!w) return false;
+                if (l === w) return true;
+                // leading numeric/letter token of "24 (5-6Y)"
+                const head = l.split(/[\s(]/)[0];
+                if (head === w) return true;
+                // the age range in brackets, against a "<n>Y" source size
+                const years = /^(\d{1,2})Y$/.exec(w);
+                const range = /\((\d{1,2})\s*-\s*(\d{1,2})Y\)/.exec(l);
+                return Boolean(years && range
+                    && Number(years[1]) >= Number(range[1])
+                    && Number(years[1]) <= Number(range[2]));
+            });
+
+        return {
+            styleCodeMatch: codeOk,
+            // Speedo's listing title carries the colour but the source row
+            // does not, so there is nothing to compare — null, not false.
+            colourMatch: null,
+            sizeAvailable: sizeOk,
+            // A one-size item (62 of the 313 rows) is exact on the code alone:
+            // there is no size to agree about.
+            exact: codeOk && (sourceVariation.oneSize ? true : sizeOk === true),
+            wantSize,
+            availableSizes: detailSizes,
+            handle: String(candidate.handle || ""),
+        };
+    }
+
+    if (destination !== "technosport") return null;
 
     const wantColour = sourceVariation.colourToken || "";
     const wantSize = sourceVariation.size || "";
@@ -778,6 +864,17 @@ const DETAIL_ENRICH_TOP_N = parseInt(process.env.DETAIL_ENRICH_TOP_N || "10", 10
 // being hit with all N at the same instant.
 const DETAIL_FETCH_CONCURRENCY = parseInt(process.env.DETAIL_FETCH_CONCURRENCY || "5", 10);
 
+// Per-target override, because what a site tolerates is a property of the SITE.
+// Speedo rate-limits hard: at the default 5 its product JSON endpoint returned
+// HTTP 429 thirty-four times in a 20-row run, turning a ~1s fetch into ~15s of
+// retries and making the whole run four times slower than it needs to be.
+// A target states `detailFetchConcurrency` in config/targetSites.js; everything
+// else keeps the shared default, so no other destination is slowed down.
+function detailConcurrencyFor(targetConfig) {
+    const n = parseInt(targetConfig && targetConfig.detailFetchConcurrency, 10);
+    return Number.isFinite(n) && n > 0 ? n : DETAIL_FETCH_CONCURRENCY;
+}
+
 function buildMatchRequest(originalProduct, comparableProducts, includeImages) {
     return {
         method: 'post',
@@ -854,6 +951,25 @@ async function enrichMatchedProduct(targetConfig, matchedProduct, sourceSku, kin
         })();
 
     try {
+        // A target whose detail endpoint returns JSON rather than a web page
+        // (`matchedDetail.expectJson`) must NOT go through the HTML path: the
+        // cheerio/XML round trip below would mangle the payload into a DOM and
+        // the extractor would see nothing. Speedo is the case this exists for —
+        // its product detail is Shopify's /products/<handle>.json.
+        if (cfg.expectJson) {
+            const payload = await timing.step(
+                `${targetConfig.label} product JSON fetch`,
+                () => fetchJson(url, { headers: (detailOptions && detailOptions.headers) || {} }),
+                { detail: url, summarize: (p) => `${Object.keys(p || {}).length} top-level key(s)` }
+            );
+            // Cached like the HTML so fields can be pulled later without
+            // re-fetching; stringified because the cache stores text.
+            const jsonFile = saveHtml(targetConfig.id, sourceSku, cacheKind, url, JSON.stringify(payload));
+            const jsonDetail = cfg.extract(payload, url);
+            if (jsonFile) jsonDetail.htmlFile = jsonFile;
+            return jsonDetail;
+        }
+
         const html = await timing.step(
             `${targetConfig.label} product page fetch`,
             () => fetchHtml(targetConfig.scraper, url, detailOptions),
@@ -900,7 +1016,7 @@ async function mapWithConcurrency(items, limit, fn) {
 // given, the top candidates are enriched CONCURRENTLY with the image pass — the
 // two slowest stages overlap instead of running back to back — and the detail is
 // attached to each candidate as `.detail`.
-async function callMatchingService(originalProduct, comparableProducts, enrichFn) {
+async function callMatchingService(originalProduct, comparableProducts, enrichFn, detailConcurrency) {
     // parseFloat of a non-numeric price yields NaN, and JSON.stringify turns
     // NaN into `null` — which the service rejects outright, because `price` is
     // `Union[float, str]` and therefore required:
@@ -920,7 +1036,12 @@ async function callMatchingService(originalProduct, comparableProducts, enrichFn
     const enrichCandidates = async (candidates) => {
         if (typeof enrichFn !== "function" || candidates.length === 0) return;
         const details = await mapWithConcurrency(
-            candidates, DETAIL_FETCH_CONCURRENCY,
+            // Per-target when the caller supplied one (a site that rate-limits
+            // needs a smaller pool), else the shared default.
+            candidates,
+            Number.isFinite(detailConcurrency) && detailConcurrency > 0
+                ? detailConcurrency
+                : DETAIL_FETCH_CONCURRENCY,
             (e) => enrichFn(e.product)
         );
         candidates.forEach((e, i) => { e.detail = details[i]; });
@@ -1087,7 +1208,14 @@ function pickBestMatch(matchData) {
 //                  returns exactly that product's colourways. See
 //                  helper/technosportSourceTitle.js.
 // ---------------------------------------------------------------------------
-const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "myntra", "nykaafashion", "footlocker", "puma", "technosport"];
+//   "speedo"    -> www.speedo.in, the brand's own site on SHOPIFY. Mode S via
+//                  Shopify's suggest.json. The style code is NOT searchable
+//                  here (unlike Technosport's) but IS the tail of every
+//                  product handle, so it verifies identity while the TITLE is
+//                  the query — with its audience code expanded ("JM" ->
+//                  "Boy's"), which took the measured hit rate from 55.9% to
+//                  90.2%. See helper/speedoSourceTitle.js.
+const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "myntra", "nykaafashion", "footlocker", "puma", "technosport", "speedo"];
 
 async function productMatching(brands, projectId, category, destination = "nahdi") {
     try {
@@ -1319,7 +1447,8 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                     (product) => enrichMatchedProduct(
                         targetConfig, product, sourceProduct.sku,
                         `candidate-${product && product.sku}`
-                    )
+                    ),
+                    detailConcurrencyFor(targetConfig)
                 );
             } catch (error) {
                 console.log(error);
@@ -1396,9 +1525,17 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             for (const cand of productBatches) {
                 if (cand && cand.sku != null) originalBySku.set(String(cand.sku), cand);
             }
-            const originalOf = (product) => {
+            // `detail` is attached to the SCORED ENTRY, not to `entry.product`,
+            // so it has to be carried onto the original explicitly — otherwise
+            // a destination whose sizes only exist in the detail payload
+            // (Speedo: suggest.json ships `variants: []`) can never see them,
+            // and reports "size unknown" for every candidate even after the
+            // product JSON was fetched successfully.
+            const originalOf = (product, detail) => {
                 const key = product && product.sku != null ? String(product.sku) : "";
-                return originalBySku.get(key) || product;
+                const base = originalBySku.get(key) || product;
+                if (detail === undefined) return base;
+                return { ...base, detail };
             };
 
             await appendToFile(matchedFilePath, {
@@ -1412,7 +1549,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                     // cannot tell two colourways of one product apart (their
                     // titles differ by one word), so this is the field that
                     // picks the variation the source row actually names.
-                    variationMatch: variationMatchOf(srcVariation, originalOf(entry.product), destination),
+                    variationMatch: variationMatchOf(srcVariation, originalOf(entry.product, entry.detail), destination),
                 })),
             });
 
@@ -1445,7 +1582,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                             matchedDetail: matchedDetail,
                             // Whether the WINNER is the right colour/size, not
                             // merely the best-scoring text match.
-                            variationMatch: variationMatchOf(srcVariation, originalOf(matchData[i].product), destination),
+                            variationMatch: variationMatchOf(srcVariation, originalOf(matchData[i].product, matchedDetail), destination),
                             // The winner's scores, flat. Same shape as the
                             // per-candidate modelScore above, so the final file
                             // and the all-candidates file can be read the same
