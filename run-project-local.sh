@@ -38,13 +38,24 @@ fi
 export PATH="$(dirname "$NODE_BIN"):$PATH"
 echo "using node $("$NODE_BIN" -v) at $NODE_BIN"
 
-# The ledger name carries the brand too, so a Puma run and an Adidas run of the
-# same project+destination do not resume off each other's progress.
+# THE LEDGER NAME IS NOT OURS TO CHOOSE. index.js writes
+# `progress_<projectId>_<destination>.jsonl` — no brand component — so the
+# ledger path must match that exactly or the resume reads an empty file it
+# created itself.
+#
+# This was a real bug: the name carried the brand ("progress_360_puma_Puma
+# .jsonl"), so `touch` made a 0-byte file next to the real 181 KB ledger, the
+# resume found nothing, and a restart reported "already done: 0" and redid
+# rows that were already finished.
+LEDGER="progress_${PROJECT}_${DEST}.jsonl"
+touch "$LEDGER"
+
+# The scratch files, by contrast, ARE ours, so they keep the brand so that a
+# Puma run and an Adidas run of the same project+destination do not read each
+# other's resume cache or sku list.
 SUFFIX="${PROJECT}_${DEST}"
 [ -n "$BRAND" ] && SUFFIX="${SUFFIX}_$(echo "$BRAND" | tr -cd '[:alnum:]')"
 
-LEDGER="progress_${SUFFIX}.jsonl"
-touch "$LEDGER"
 PROGRESS="/tmp/done_${SUFFIX}.txt"
 SKUFILE="/tmp/skus_${SUFFIX}.txt"
 PAYLOAD="/tmp/payload_${SUFFIX}.json"
