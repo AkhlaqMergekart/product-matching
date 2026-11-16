@@ -6,6 +6,8 @@ const { logEvent } = require("../helper/timingLogger.js");
 const spApi = require("../helper/spApiClient.js");
 const { searchFlipkart } = require("../helper/flipkartClient.js");
 const { searchGambol } = require("../helper/gambolClient.js");
+const { searchNike } = require("../helper/nikeClient.js");
+const { searchAdidas } = require("../helper/adidasClient.js");
 const { hasApiKey: hasScrapeOpsKey } = require("../helper/scrapeOpsClient.js");
 
 // config.json is the repo's home for deploy-time overrides (see
@@ -729,7 +731,215 @@ const targetSites = {
       },
     },
   },
+
+  // Nike's official Indian store, nike.in (helper/nikeClient.js): its search
+  // API by title, then each product's API, all through ScrapeOps. The first
+  // 10 results are kept.
+  //
+  // variantMatching: how a source row's `variant` ("us-10", "l") is found
+  // among a candidate's sizes (helper/sizeVariants.js). nike.in lists shoes in
+  // UK sizes only; `conversion` is Nike's US-to-UK chart (men's US 10 = UK 9,
+  // women's US 8 = UK 5.5, kids' US 5Y = UK 4.5).
+  nike: {
+    id: "nike",
+    label: "Nike India",
+    variantMatching: {
+      conversion: { men: 1, women: 2.5, kids: 0.5 },
+      bareShoeSystem: "uk",
+    },
+    searchApi: {
+      maxResults: 10,
+
+      checkReady() {
+        if (!hasScrapeOpsKey()) {
+          throw new Error("ScrapeOps API key is not configured (see helper/scrapeOpsClient.js).");
+        }
+      },
+
+      search(query) {
+        return searchNike(query, this.maxResults);
+      },
+
+      mapHit({ listing, detail }) {
+        const product = detail || listing;
+        const summary = attributesByLabel(detail?.product_summary?.attributes);
+        const price = round2(product.discountedPrice ?? product.price);
+
+        return {
+          url: `https://www.nike.in${product.action_url || listing.actionUrl || ""}`,
+          category: nikeCategory(detail, listing),
+          brand: "Nike",
+          title: nikeTitle(product.title || listing.title, product.subTitle || listing.subTitle),
+          // nike.in's product id; Nike's own style code is styleCode.
+          sku: String(listing.id || product.id),
+          styleCode: summary["Style"] || nikeStyleCodeFromImage(product.imageUrl || listing.imageUrl),
+          color: (summary["Colour Shown"] || detail?.color?.name || "").replace(/\|/g, " / "),
+          price,
+          mrp: round2(product.price) || price,
+          inStock: !(product.isOutOfStock ?? listing.isOutOfStock),
+          totalRating: "",
+          totalReview: "",
+          express: false,
+          description: nikeDescription(detail),
+          images: nikeImages(detail, listing),
+          variants: nikeVariants(detail, listing),
+        };
+      },
+    },
+  },
+
+  // adidas.co.in (helper/adidasClient.js): searched by the source row's
+  // article code, which opens that product's page, or else by title (first
+  // 10 results, each read from its own page). Through ScrapeOps' premium
+  // level_2 pool, the only one adidas lets through.
+  //
+  // `conversion` is adidas's US-to-UK chart (men's US 10 = UK 9.5, women's
+  // US 8 = UK 6.5), for a source size given in US.
+  adidas: {
+    id: "adidas",
+    label: "adidas India",
+    variantMatching: {
+      conversion: { men: 0.5, women: 1.5, kids: 0.5 },
+      bareShoeSystem: "uk",
+    },
+    searchApi: {
+      maxResults: 10,
+
+      checkReady() {
+        if (!hasScrapeOpsKey()) {
+          throw new Error("ScrapeOps API key is not configured (see helper/scrapeOpsClient.js).");
+        }
+      },
+
+      search(query, sourceProduct) {
+        return searchAdidas(query, sourceProduct, this.maxResults);
+      },
+
+      mapHit({ listing, product }) {
+        if (!product) return adidasFromListing(listing);
+        const attributes = product.attribute_list || {};
+        const pricing = product.pricing_information || {};
+        const price = round2(pricing.currentPrice ?? pricing.sale_price ?? pricing.standard_price);
+
+        return {
+          url: adidasUrl(product.meta_data?.canonical) || listing?.url || `https://www.adidas.co.in/${product.id}.html`,
+          category: [...(product.breadcrumb_list || []).map((b) => b.text), ...(attributes.productType || [])].filter(Boolean).join(" > "),
+          brand: "adidas",
+          title: String(product.meta_data?.page_title || `adidas ${product.name}`).replace(/\s*\|\s*adidas India\s*$/i, ""),
+          sku: String(product.id),
+          modelNumber: product.model_number || "",
+          color: attributes.color || attributes.search_color || "",
+          gender: attributes.gender || "",
+          price,
+          mrp: round2(pricing.standard_price) || price,
+          totalRating: listing?.rating != null ? String(round2(listing.rating)) : "",
+          totalReview: listing?.ratingCount != null ? String(listing.ratingCount) : "",
+          express: false,
+          description: adidasDescription(product.product_description),
+          images: (product.view_list || []).map((view) => view.image_url).filter(Boolean),
+          // The page lists sizes but not their stock (the availability API
+          // refuses every ScrapeOps pool).
+          variants: (product.variation_list || []).map((v) => ({ label: v.size, sku: v.sku, gtin: v.gtin || "", inStock: null })),
+        };
+      },
+    },
+  },
 };
+
+// { label: value } from nike.in's [{ label, value }] attribute lists.
+function attributesByLabel(list) {
+  return Object.fromEntries((Array.isArray(list) ? list : []).map((a) => [a.label, a.value]));
+}
+
+// nike.in splits names oddly: "Nike Victori One" + "Men's Slides", but also
+// "Jordan Franchise" + "Nike Jordan Franchise Shower Slides".
+function nikeTitle(title, subTitle) {
+  const t = String(title || "").trim();
+  const s = String(subTitle || "").trim();
+  if (!s) return t;
+  if (s.toLowerCase().includes(t.toLowerCase())) return s;
+  return `${t} ${s}`;
+}
+
+// Image files are named after the style code: ".../1e462d9Nike-CN9675-401_1.jpg".
+function nikeStyleCodeFromImage(url) {
+  return (String(url || "").match(/Nike-([A-Z0-9]{5,7}-\d{3})_/i) || [])[1] || "";
+}
+
+function nikeCategory(detail, listing) {
+  const crumbs = Array.isArray(detail?.breadcrumbs) ? detail.breadcrumbs.map((b) => b?.name || b?.title || b?.label).filter(Boolean) : [];
+  return crumbs.length ? crumbs.join(" > ") : detail?.subTitle || listing?.subTitle || "";
+}
+
+function nikeDescription(detail) {
+  const text = detail?.product_summary?.description || detail?.view_product_details || "";
+  return cheerio.load(String(text).replace(/</g, " <")).root().text().replace(/\s+/g, " ").trim();
+}
+
+// Without the "?rnd=..." cache-buster.
+function nikeImages(detail, listing) {
+  const media = (detail?.productMedia || []).filter((m) => m?.mediaType === "image");
+  const images = media.length ? media : listing?.plp_pdp_bridge?.images || [];
+  const urls = images.map((m) => m.url).filter(Boolean);
+  if (urls.length === 0 && (detail?.imageUrl || listing?.imageUrl)) urls.push(detail?.imageUrl || listing.imageUrl);
+  return urls.map((url) => url.replace(/\?rnd=\d+$/, ""));
+}
+
+// Every size with its stock. The product API has per-size price too; the
+// search API (fallback) only names and stock.
+function nikeVariants(detail, listing) {
+  const options = detail?.sizeOptions?.options;
+  if (Array.isArray(options) && options.length) {
+    return options.map((o) => ({
+      label: o.sizeName || o.optionValue || o.title,
+      sku: o.sku,
+      id: String(o.id),
+      inStock: !o.isOutOfStock,
+      price: round2(o.discountedPrice),
+      mrp: round2(o.price),
+    }));
+  }
+  return (listing?.plp_pdp_bridge?.variants?.size || []).map((v) => ({
+    label: v.name,
+    sku: v.sku,
+    id: String(v.id),
+    inStock: String(v.in_stock) === "1",
+  }));
+}
+
+// Canonicals come protocol-relative ("//www.adidas.co.in/...").
+function adidasUrl(canonical) {
+  if (!canonical) return "";
+  return canonical.startsWith("//") ? `https:${canonical}` : canonical;
+}
+
+function adidasDescription(description) {
+  if (!description) return "";
+  return [description.subtitle, description.text, ...(description.usps || [])].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+}
+
+// A results-page entry whose product page couldn't be read: no sizes, so it
+// can only match a source row without a variant.
+function adidasFromListing(listing) {
+  const price = round2(listing?.priceData?.prices?.find((p) => p.type === "sale")?.value ?? listing?.priceData?.prices?.[0]?.value);
+  return {
+    url: listing?.url || "",
+    category: listing?.category || "",
+    brand: "adidas",
+    title: `adidas ${listing?.title || ""}`.trim(),
+    sku: String(listing?.id || ""),
+    modelNumber: listing?.modelNumber || "",
+    color: "",
+    price,
+    mrp: round2(listing?.priceData?.prices?.find((p) => p.type === "original")?.value) || price,
+    totalRating: listing?.rating != null ? String(round2(listing.rating)) : "",
+    totalReview: listing?.ratingCount != null ? String(listing.ratingCount) : "",
+    express: false,
+    description: "",
+    images: [listing?.image, listing?.hoverImage].filter(Boolean),
+    variants: [],
+  };
+}
 
 // Gambol's vendor is often a sub-line ("Adidas Kids") while the brand itself
 // is in a "Brand_Adidas" tag, and brand is one of the four match gates.

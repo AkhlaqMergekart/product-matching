@@ -11,6 +11,7 @@ const { exportResultsToExcel } = require("./helper/exportResults.js");
 const timing = require("./helper/timingLogger.js");
 const { buildSearchQuery } = require("./helper/searchQuery.js");
 const { toDirectImageUrls } = require("./helper/imageUrls.js");
+const { pickVariant, productGender } = require("./helper/sizeVariants.js");
 const targetSites = require("./config/targetSites.js");
 const brandTargets = require("./config/brandTargets.js");
 
@@ -193,14 +194,17 @@ async function buildCandidatesFromApi(targetConfig, doc, query) {
 // there is no search page to parse and no fetch per candidate. Throws when the
 // search fails, so each caller keeps its own posture — the legacy flow
 // retries, the brand flow skips.
-async function buildCandidatesFromSearchApi(targetConfig, query) {
+//
+// `sourceProduct` is passed on for targets that search by more than the
+// title (adidas tries the row's article code first); others ignore it.
+async function buildCandidatesFromSearchApi(targetConfig, query, sourceProduct = null) {
     const api = targetConfig.searchApi;
 
     // Logged with the query, not a URL: credentials travel in headers, and
     // the query is what's worth reading.
     const hits = await timing.step(
         `${targetConfig.label} search API`,
-        () => api.search(query),
+        () => api.search(query, sourceProduct),
         { detail: query, summarize: (results) => `${results.length} result(s)` }
     );
 
@@ -217,15 +221,29 @@ async function buildCandidatesFromSearchApi(targetConfig, query) {
     return candidates;
 }
 
+// buildCandidatesFromSearchApi, asked once per query and source SKU in a run
+// (`cache` is the run's Map). A failed search is not kept, so a retry asks
+// again. Every caller gets its own copy: the variant step adds fields to
+// candidates.
+async function cachedSearchApi(cache, targetConfig, query, sourceProduct) {
+    const key = `${query}\u0000${sourceProduct?.sku ?? ""}`;
+    if (cache.has(key)) {
+        timing.logEvent(`${targetConfig.label} search reused from an earlier row with the same SKU`);
+    } else {
+        cache.set(key, await buildCandidatesFromSearchApi(targetConfig, query, sourceProduct));
+    }
+    return structuredClone(cache.get(key));
+}
+
 // Searches `targetConfig`'s site for `query` and returns a full list of
 // candidate product objects, ready to hand to the matching service. This is
 // the piece that used to be hardcoded to Nahdi — every site-specific fact
 // (search URL, listing/detail selectors, which fetch strategy to use) comes
 // from targetConfig (config/targetSites.js) instead.
-async function buildCandidatesFromSearch(targetConfig, query) {
+async function buildCandidatesFromSearch(targetConfig, query, sourceProduct = null) {
     if (targetConfig.searchApi) {
         try {
-            return await buildCandidatesFromSearchApi(targetConfig, query);
+            return await buildCandidatesFromSearchApi(targetConfig, query, sourceProduct);
         } catch (err) {
             console.error(`Error searching ${targetConfig.label} for "${query}":`, err.message);
             return [];
@@ -371,6 +389,11 @@ const MAX_MATCH_IMAGES = 4;
 // addresses — see helper/imageUrls.js). The stored product is not changed.
 function prepareForMatching(product) {
     const copy = withStringTextFields(product);
+    // Size lists and the picked variant are for the result files; the
+    // service compares the size through `model` (see selectSourceVariant).
+    delete copy.variants;
+    delete copy.destinationVariant;
+    if (copy.model != null) copy.model = toText(copy.model);
     if (copy.images != null) copy.images = toDirectImageUrls(copy.images);
     // Every image sent is downloaded and compared by the service, and Amazon
     // and Flipkart list up to 9-10 photos a product. Every target lists the
@@ -453,15 +476,17 @@ function byCompositeScore(a, b) {
     return (b.composite_score || 0) - (a.composite_score || 0);
 }
 
-// The service's response strips `images`, so the JSON files would hold no
-// destination images at all. Puts back the full scraped list, not the
-// MAX_MATCH_IMAGES sent for comparison. Entries are matched on SKU.
-function restoreCandidateImages(matchData, comparableProducts) {
-    const imagesBySku = new Map(comparableProducts.map((candidate) => [String(candidate.sku), candidate.images]));
+// The service's response strips `images` (and anything else it doesn't
+// score, such as sizes), so the JSON files would hold only part of what was
+// scraped. Puts back the whole scraped candidate — the full image list, not
+// the MAX_MATCH_IMAGES sent for comparison, its sizes and the picked
+// variant. Entries are matched on SKU.
+function restoreCandidateData(matchData, comparableProducts) {
+    const bySku = new Map(comparableProducts.map((candidate) => [String(candidate.sku), candidate]));
 
     for (const entry of matchData) {
-        const images = imagesBySku.get(String(entry.product?.sku));
-        if (images) entry.product.images = images;
+        const scraped = bySku.get(String(entry.product?.sku));
+        if (scraped) entry.product = { ...entry.product, ...scraped };
     }
 
     return matchData;
@@ -469,7 +494,41 @@ function restoreCandidateImages(matchData, comparableProducts) {
 
 async function callMatchingService(originalProduct, comparableProducts) {
     const matchData = await scoreCandidates(originalProduct, comparableProducts);
-    return restoreCandidateImages(matchData, comparableProducts);
+    return restoreCandidateData(matchData, comparableProducts);
+}
+
+// For a source row with a `variant` (project 360: "l", "uk-8", "us-10"),
+// keeps only the candidates that come in that size, each with the size it
+// was matched to as `destinationVariant`. The size goes to the matching
+// service as `model` on both sides, so its response has a model score:
+// the source sends its variant, a candidate its own size label (for a
+// converted shoe size, with the source size after it: "UK 9 (us-10)").
+//
+// Only targets with `variantMatching` (nike, adidas) list sizes; for the
+// others every candidate is kept, as before.
+function selectSourceVariant(targetConfig, sourceProduct, candidates) {
+    const wanted = String(sourceProduct.variant || "").trim();
+    if (!wanted || !targetConfig.variantMatching) return { source: sourceProduct, candidates, skipped: [] };
+
+    const options = { ...targetConfig.variantMatching, gender: productGender(sourceProduct) };
+    const kept = [];
+    const skipped = [];
+
+    for (const candidate of candidates) {
+        const variant = pickVariant(wanted, candidate.variants, options);
+        if (!variant) {
+            skipped.push({ sku: candidate.sku, title: candidate.title, url: candidate.url, sizes: (candidate.variants || []).map((v) => v.label) });
+            continue;
+        }
+        kept.push({
+            ...candidate,
+            model: variant.matchType === "converted" ? `${variant.label} (${wanted})` : variant.label,
+            destinationVariant: variant,
+        });
+    }
+
+    timing.logEvent(`Variant "${wanted}" (${options.gender}): on ${kept.length}/${candidates.length} candidate(s)`);
+    return { source: { ...sourceProduct, model: wanted }, candidates: kept, skipped };
 }
 
 // Scores every candidate on text, then compares images only for the best
@@ -565,8 +624,15 @@ function pickBestMatch(matchData) {
 //   "gambol"    -> Gambol's search page, then each product's Shopify JSON, all
 //                  through ScrapeOps (needs its API key, see
 //                  helper/scrapeOpsClient.js).
+//   "nike"      -> nike.in's search and product APIs through ScrapeOps.
+//   "adidas"    -> adidas.co.in through ScrapeOps' premium pool, by article
+//                  code and then by title.
+//
+// nike and adidas list every candidate's sizes. A source row with a `variant`
+// is matched only against candidates that come in that size, and the result
+// files carry both sides' variant (see selectSourceVariant).
 // ---------------------------------------------------------------------------
-const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "amazon", "flipkart", "gambol"];
+const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "amazon", "flipkart", "gambol", "nike", "adidas"];
 
 async function productMatching(brands, projectId, category, destination = "nahdi") {
     try {
@@ -605,10 +671,20 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             },
             // limit: 1,
             raw: true,
-            attributes: ['title', 'url', 'brand', 'sku', 'category', 'images', 'attributes', 'price', 'mrp']
+            attributes: ['title', 'url', 'brand', 'sku', 'category', 'images', 'attributes', 'price', 'mrp', 'description', 'variant']
         });
 
+        if (sourceProducts.length === 0) {
+            throw new Error(`No source rows found for projectId ${projectId} and the ${brands.length} SKU(s) given.`);
+        }
+
         const brand = sourceProducts[0].brand;
+
+        // Project 360 holds one row per SKU and size, so a SKU's rows all run
+        // the same search. Each search is paid ScrapeOps requests (Nike ~11,
+        // adidas up to 11 at ~12s each), so a run asks once per query and
+        // SKU, and each row gets its own copy of the candidates.
+        const searchCache = new Map();
 
         console.log("Brand: ", sourceProducts[0].brand, "Source products count:", sourceProducts.length);
 
@@ -663,7 +739,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                 // escalate now; a retry gets a fresh browser context and
                 // therefore a fresh rotating exit IP instead.
                 searchResult = usesSearchApi
-                    ? await buildCandidatesFromSearchApi(targetConfig, searchQuery)
+                    ? await cachedSearchApi(searchCache, targetConfig, searchQuery, sourceProduct)
                     : await timing.step(
                         `${targetConfig.label} search page fetch`,
                         () => fetchPage(url),
@@ -734,9 +810,31 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
             console.log("Found products in batch:", productBatches.length);
 
+            const sourceVariant = sourceProduct.variant || null;
+            const variantSelection = selectSourceVariant(targetConfig, sourceProduct, productBatches);
+            productBatches = variantSelection.candidates;
+
+            if (productBatches.length === 0) {
+                console.log(`Variant "${sourceVariant}" not on any candidate for:`, sourceProduct.title);
+                timing.logEvent(`Result: variant "${sourceVariant}" not on any candidate, skipped`);
+                await appendToFile(errorFilePath, {
+                    sourceProduct: sourceProduct,
+                    sourceVariant,
+                    error: `Variant "${sourceVariant}" not available on any candidate`,
+                    candidatesWithoutVariant: variantSelection.skipped,
+                });
+                await appendToFile(outputFilePath, {
+                    sourceProduct: sourceProduct,
+                    sourceVariant,
+                    destinationVariant: null,
+                    matchedProducts: {}
+                });
+                continue;
+            }
+
             let matchData = [];
             try {
-                matchData = await callMatchingService(sourceProduct, productBatches);
+                matchData = await callMatchingService(variantSelection.source, productBatches);
             } catch (error) {
                 console.log(error);
                 console.error("Error matching products:", error);
@@ -760,9 +858,12 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
             console.log("Match data found:", matchData.length);
 
+            // Each matched product carries its own destinationVariant.
             await appendToFile(matchedFilePath, {
                 sourceProduct: sourceProduct,
+                sourceVariant,
                 matchedProducts: matchData,
+                ...(variantSelection.skipped.length > 0 && { candidatesWithoutVariant: variantSelection.skipped }),
             });
 
             let foundProductCount = 0;
@@ -775,6 +876,8 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                     if (fieldScores && fieldScores.title >= 0.85 && fieldScores.brand >= 0.85 && fieldScores.color >= 0.85 && fieldScores.image_similarity >= 0.85) {
                         const finalObj = {
                             sourceProduct: sourceProduct,
+                            sourceVariant,
+                            destinationVariant: matchData[i].product?.destinationVariant || null,
                             matchedProducts: matchData[i],
                         };
 
@@ -809,6 +912,8 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
                 await appendToFile(outputFilePath, {
                     sourceProduct: sourceProduct,
+                    sourceVariant,
+                    destinationVariant: null,
                     matchedProducts: {}
                 });
 
@@ -946,7 +1051,7 @@ async function runBrandMatching(brandName, projectId, skus = null) {
 
                 const candidates = await timing.step(
                     `${targetConfig.label} candidate collection`,
-                    () => buildCandidatesFromSearch(targetConfig, buildSearchQuery(sourceProduct)),
+                    () => buildCandidatesFromSearch(targetConfig, buildSearchQuery(sourceProduct), sourceProduct),
                     { summarize: (c) => `${c.length} candidate(s)` }
                 );
                 if (candidates.length === 0) {

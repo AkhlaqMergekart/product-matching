@@ -2,7 +2,8 @@ const path = require("path");
 const axios = require("axios");
 const { logEvent } = require("./timingLogger.js");
 
-// ScrapeOps' proxy API, for a site that refuses our own fetch paths (Gambol).
+// ScrapeOps' proxy API, for sites that refuse our own fetch paths (Gambol,
+// nike.in, adidas.co.in).
 // Paid per request, so nothing else goes through it. The key comes from
 // SCRAPEOPS_API_KEY (env) or SCRAPEOPS_Api_Key (config.json).
 const fileConfig = (() => {
@@ -25,15 +26,25 @@ const hasApiKey = () => Boolean(API_KEY);
 
 // One request. Errors are rebuilt here because the request URL holds the API
 // key, and index.js logs whole error objects.
-async function request(url, attempt) {
-  const params = new URLSearchParams({ api_key: API_KEY, url, render_js: "false" });
+//
+// options.premium: a ScrapeOps premium proxy level ("level_1", "level_2") used
+// on every attempt. adidas.co.in answers only through level_2; Nike and
+// Gambol pass nothing and get the plain pool first.
+// options.timeoutMs / options.attempts: per-site overrides of the defaults
+// above. ScrapeOps takes ~80s to give up on an adidas page (HTTP 500) while a
+// good one takes ~12s, so adidas stops waiting sooner and retries once.
+async function request(url, attempt, options = {}) {
+  // options.renderJs: have ScrapeOps load the page in its own browser. Costs
+  // more credits; adidas.co.in needs it (see helper/adidasClient.js).
+  const params = new URLSearchParams({ api_key: API_KEY, url, render_js: options.renderJs ? "true" : "false" });
   // A failed plain request gets ScrapeOps' stronger proxy pool on the retry.
-  if (attempt > 1) params.set("premium", "level_1");
+  if (options.premium) params.set("premium", options.premium);
+  else if (attempt > 1) params.set("premium", "level_1");
 
   let response;
   try {
     response = await axios.get(`${API_URL}?${params}`, {
-      timeout: REQUEST_TIMEOUT_MS,
+      timeout: options.timeoutMs || REQUEST_TIMEOUT_MS,
       responseType: "text",
       transformResponse: (body) => body,
       validateStatus: () => true,
@@ -51,13 +62,14 @@ async function request(url, attempt) {
 }
 
 // Fetches `url` through ScrapeOps and returns the body as text.
-async function fetchViaScrapeOps(url) {
+async function fetchViaScrapeOps(url, options = {}) {
+  const maxAttempts = options.attempts || MAX_ATTEMPTS;
   for (let attempt = 1; ; attempt++) {
     try {
-      return await request(url, attempt);
+      return await request(url, attempt, options);
     } catch (err) {
-      if (err.final || attempt === MAX_ATTEMPTS) throw err;
-      logEvent(`  ScrapeOps attempt ${attempt}/${MAX_ATTEMPTS} failed — ${err.message}`);
+      if (err.final || attempt >= maxAttempts) throw err;
+      logEvent(`  ScrapeOps attempt ${attempt}/${maxAttempts} failed — ${err.message}`);
     }
   }
 }
