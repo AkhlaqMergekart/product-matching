@@ -48,6 +48,8 @@ touch "$LEDGER"
 PROGRESS="/tmp/done_${SUFFIX}.txt"
 SKUFILE="/tmp/skus_${SUFFIX}.txt"
 PAYLOAD="/tmp/payload_${SUFFIX}.json"
+# The payload builder's script body, written out once per chunk (see below).
+PAYLOAD_JS="/tmp/payload_${SUFFIX}.js"
 
 # Per-VARIATION resume, keyed on asin rather than sku.
 #
@@ -61,15 +63,22 @@ PAYLOAD="/tmp/payload_${SUFFIX}.json"
 # size and silently skip the other six. index.js records `asin` on every
 # ledger line for exactly this reason; sku is the fallback for rows/projects
 # that have no asin.
-"$NODE_BIN" -e "
-const fs=require('fs');
-const done=new Set();
-for(const l of fs.readFileSync('$LEDGER','utf8').split('\n')){
-  if(!l.trim())continue;
-  try{ const j=JSON.parse(l); done.add(String(j.asin||j.sku)); }catch(e){}
+#
+# Passed via a QUOTED heredoc, not `node -e "..."`. Inside a double-quoted
+# shell string the backslash of `\n` is eaten by the shell, so node received
+# `split('n')` — splitting the ledger on the LETTER n. That produced garbage
+# keys that matched no row, the resume silently did nothing ("already done: 0"
+# on a restart with 411 rows in the ledger), and 52 asins were processed twice.
+# A <<'EOF' heredoc passes the script through byte-for-byte.
+LEDGER="$LEDGER" PROGRESS="$PROGRESS" "$NODE_BIN" <<'NODE_RESUME'
+const fs = require("fs");
+const done = new Set();
+for (const line of fs.readFileSync(process.env.LEDGER, "utf8").split("\n")) {
+  if (!line.trim()) continue;
+  try { const j = JSON.parse(line); done.add(String(j.asin || j.sku)); } catch (e) { /* skip */ }
 }
-fs.writeFileSync('$PROGRESS',[...done].map(s=>s+'\n').join(''));
-"
+fs.writeFileSync(process.env.PROGRESS, [...done].map((s) => s + "\n").join(""));
+NODE_RESUME
 
 # Pull one line PER ROW (not per sku) for the project and brand, as
 # "<asin>\t<sku>": every variation row must be processed, so this must not
@@ -81,14 +90,26 @@ fs.writeFileSync('$PROGRESS',[...done].map(s=>s+'\n').join(''));
 # which looks identical to "this brand isn't in the project".
 BRAND_FILTER=""
 [ -n "$BRAND" ] && BRAND_FILTER=", brand: { [require('sequelize').Op.iLike]: '%$BRAND%' }"
-"$NODE_BIN" -e "
-const SP=require('./models/scratchProducts.js');
-(async()=>{
-  const rows=await SP.findAll({where:{projectId:$PROJECT$BRAND_FILTER},attributes:['sku','asin'],raw:true});
-  console.log(rows.map(r=>[String(r.asin||r.sku),String(r.sku)].join('\t')).join('\n'));
+#
+# Quoted heredoc for the same reason as the resume block above: this emits
+# "<asin>\t<sku>" per line, and a shell-eaten `\t`/`\n` would collapse the
+# whole result onto one line with literal t/n characters in place of the
+# separators. The brand filter and project id are passed as ENV, not
+# interpolated into the script text.
+PROJECT="$PROJECT" BRAND="$BRAND" "$NODE_BIN" <<'NODE_SKUS' 2>/dev/null | grep -v '^\*\*\*' | grep -v '^$' > "$SKUFILE"
+const SP = require("./models/scratchProducts.js");
+const { Op } = require("sequelize");
+(async () => {
+  const where = { projectId: Number(process.env.PROJECT) };
+  // Case-insensitive substring match (the SQL `brand ILIKE '%x%'`): the stored
+  // spelling is not always what you would type, and an exact filter returns 0
+  // rows on a near miss, which looks identical to "brand not in the project".
+  if (process.env.BRAND) where.brand = { [Op.iLike]: `%${process.env.BRAND}%` };
+  const rows = await SP.findAll({ where, attributes: ["sku", "asin"], raw: true });
+  console.log(rows.map((r) => [String(r.asin || r.sku), String(r.sku)].join("\t")).join("\n"));
   process.exit(0);
 })();
-" 2>/dev/null | grep -v '^\*\*\*' | grep -v '^$' > "$SKUFILE"
+NODE_SKUS
 
 TOTAL=$(wc -l < "$SKUFILE" | tr -d ' ')
 DISTINCT_SKU=$(cut -f2 "$SKUFILE" | sort -u | wc -l | tr -d ' ')
@@ -175,12 +196,25 @@ while IFS=$'\t' read -r KEY SKU; do
   if [ "${#DONEKEYS[@]}" -lt "$CHUNK" ] && [ "$N" -lt "$TOTAL" ]; then continue; fi
 
   # Build the payload with node so SKUs containing quotes or spaces are safe.
-  printf '%s\n' "${BATCH[@]}" | "$NODE_BIN" -e "
-const fs=require('fs');
-const skus=fs.readFileSync(0,'utf8').split('\n').filter(Boolean);
-fs.writeFileSync('$PAYLOAD',JSON.stringify({brand:skus,projectId:$PROJECT,destination:'$DEST'}));
-console.error('  chunk of '+skus.length);
-"
+  # Same shell-eats-the-backslash problem as the two blocks above:
+  # `split('\n')` became `split('n')`, splitting a sku list on the LETTER n.
+  # It happened to look fine only while no sku contained an "n".
+  #
+  # A heredoc cannot be used here because stdin is already the piped sku list,
+  # so the script goes in a temp file written by a quoted heredoc instead, and
+  # the skus are passed as ARGUMENTS rather than read from stdin.
+  cat > "$PAYLOAD_JS" <<'NODE_PAYLOAD'
+const fs = require("fs");
+const skus = process.argv.slice(2).filter(Boolean);
+fs.writeFileSync(process.env.PAYLOAD, JSON.stringify({
+  brand: skus,
+  projectId: Number(process.env.PROJECT),
+  destination: process.env.DEST,
+}));
+console.error("  chunk of " + skus.length);
+NODE_PAYLOAD
+  PAYLOAD="$PAYLOAD" PROJECT="$PROJECT" DEST="$DEST" \
+    "$NODE_BIN" "$PAYLOAD_JS" "${BATCH[@]}"
 
   curl -s -m 60 -X POST http://127.0.0.1:8010/product-matching \
        -H "Content-Type: application/json" -d @"$PAYLOAD" > /dev/null
