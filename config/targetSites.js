@@ -8,6 +8,7 @@ const { searchFlipkart } = require("../helper/flipkartClient.js");
 const { searchGambol } = require("../helper/gambolClient.js");
 const { searchNike } = require("../helper/nikeClient.js");
 const { searchAdidas } = require("../helper/adidasClient.js");
+const { searchAsics, BASE_URL: ASICS_BASE_URL } = require("../helper/asicsClient.js");
 const { hasApiKey: hasScrapeOpsKey } = require("../helper/scrapeOpsClient.js");
 
 // config.json is the repo's home for deploy-time overrides (see
@@ -844,7 +845,74 @@ const targetSites = {
       },
     },
   },
+
+  // asics.co.in (helper/asicsClient.js): its GraphQL API, by the row's SKU
+  // and then by title (first 10 results), through ScrapeOps. One request
+  // carries every field, sizes included.
+  //
+  // Shoe sizes are labelled in US and UK ("US10/UK9", "US10H/UK9H"), so a
+  // US or UK source size matches without a chart; `conversion` is ASICS's
+  // US-to-UK offset, used only if a label carries one system.
+  asics: {
+    id: "asics",
+    label: "ASICS India",
+    variantMatching: {
+      conversion: { men: 1, women: 2, kids: 1 },
+      bareShoeSystem: "uk",
+    },
+    searchApi: {
+      maxResults: 10,
+
+      checkReady() {
+        if (!hasScrapeOpsKey()) {
+          throw new Error("ScrapeOps API key is not configured (see helper/scrapeOpsClient.js).");
+        }
+      },
+
+      search(query, sourceProduct) {
+        return searchAsics(query, sourceProduct, this.maxResults);
+      },
+
+      mapHit(item) {
+        const prices = item.price_range?.minimum_price || {};
+        const price = round2(prices.final_price?.value);
+        const sizeOption = (item.configurable_options || []).find((o) => o.attribute_code === "size");
+
+        return {
+          url: `${ASICS_BASE_URL}/${item.url_key}${item.url_suffix || ".html"}`,
+          category: (item.categories || []).map((c) => c.name).filter(Boolean).join(" > "),
+          brand: "ASICS",
+          title: [item.name, item.color_label].filter(Boolean).join(" - "),
+          sku: String(item.sku),
+          color: item.color_label || "",
+          price,
+          mrp: round2(prices.regular_price?.value) || price,
+          inStock: item.stock_status === "IN_STOCK",
+          totalRating: "",
+          totalReview: "",
+          express: false,
+          description: gambolDescription(item.description?.html),
+          images: asicsImages(item),
+          variants: (item.variants || []).map((v) => {
+            const size = (v.attributes || []).find((a) => a.code === "size") || v.attributes?.[0] || {};
+            return { label: size.label || "", sku: v.product?.sku || "", inStock: v.product?.stock_status === "IN_STOCK" };
+          }),
+          sizeOptions: (sizeOption?.values || []).map((v) => v.label),
+        };
+      },
+    },
+  },
 };
+
+// Gallery in position order, without Magento's resize query string.
+function asicsImages(item) {
+  const gallery = (item.media_gallery || [])
+    .filter((m) => m?.url && !m.disabled)
+    .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+    .map((m) => m.url);
+  const urls = gallery.length ? gallery : item.small_image?.url ? [item.small_image.url] : [];
+  return [...new Set(urls.map((url) => url.split("?")[0]))];
+}
 
 // { label: value } from nike.in's [{ label, value }] attribute lists.
 function attributesByLabel(list) {

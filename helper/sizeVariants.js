@@ -46,9 +46,10 @@ function parseSize(label) {
   if (ONE_SIZE.test(text)) return [{ kind: "one" }];
 
   const tokens = [];
-  const shoe = /\b(us|uk|eu)\s*[-:]?\s*(\d{1,2}(?:[.-]5)?)(?![\d.])/g;
+  // A trailing "h" is a half size: ASICS labels "US10H/UK9H" (US 10.5).
+  const shoe = /\b(us|uk|eu)\s*[-:]?\s*(\d{1,2}(?:[.-]5)?)(h)?(?![\d.])/g;
   for (let m; (m = shoe.exec(text)); ) {
-    tokens.push({ kind: "shoe", system: m[1], value: shoeNumber(m[2]) });
+    tokens.push({ kind: "shoe", system: m[1], value: shoeNumber(m[2]) + (m[3] ? 0.5 : 0) });
   }
   if (tokens.length) return tokens;
 

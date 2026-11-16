@@ -627,12 +627,14 @@ function pickBestMatch(matchData) {
 //   "nike"      -> nike.in's search and product APIs through ScrapeOps.
 //   "adidas"    -> adidas.co.in through ScrapeOps' premium pool, by article
 //                  code and then by title.
+//   "asics"     -> asics.co.in's GraphQL API through ScrapeOps, by SKU and
+//                  then by title.
 //
-// nike and adidas list every candidate's sizes. A source row with a `variant`
+// nike, adidas and asics list every candidate's sizes. A source row with a `variant`
 // is matched only against candidates that come in that size, and the result
 // files carry both sides' variant (see selectSourceVariant).
 // ---------------------------------------------------------------------------
-const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "amazon", "flipkart", "gambol", "nike", "adidas"];
+const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "amazon", "flipkart", "gambol", "nike", "adidas", "asics"];
 
 async function productMatching(brands, projectId, category, destination = "nahdi") {
     try {
