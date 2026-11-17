@@ -1008,7 +1008,7 @@ async function runBrandMatching(brandName, projectId, skus = null) {
     // means nothing on Amazon UAE / Firstcry UAE).
     const where = { brand: { [Op.iLike]: brandName }, projectId };
     if (Array.isArray(skus) && skus.length > 0) {
-        where.sku = { [Op.in]: skus.map((s) => String(s)) };
+        where.asin = { [Op.in]: skus.map((s) => String(s)) };
     }
 
     const localCatalog = await ScratchProducts.findAll({
