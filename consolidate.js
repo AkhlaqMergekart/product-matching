@@ -267,7 +267,13 @@ notes.push(`Total attachment size: ${(total / 1048576).toFixed(2)} MB`);
     await sendUpdateReportEmail({
       from: config.FROM_EMAIL,
       to: TO,
-      subject: `Consolidated product matching output - project ${PROJECT}${part}`,
+      // SUBJECT_PREFIX lets the caller name the brand(s) the mail covers, so a
+      // per-brand send is identifiable in an inbox. The destination list is a
+      // poor substitute: one consolidation can cover several, and the reader
+      // wants the brand. Falls back to the generic wording.
+      subject: process.env.SUBJECT_PREFIX
+        ? `${process.env.SUBJECT_PREFIX} | project ${PROJECT}${part}`
+        : `Consolidated product matching output - project ${PROJECT}${part}`,
       // Only the first message carries the full notes; the rest just list files.
       text: i === 0
         ? notes.join("\n")
