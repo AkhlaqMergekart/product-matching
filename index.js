@@ -636,7 +636,7 @@ function pickBestMatch(matchData) {
 // ---------------------------------------------------------------------------
 const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "amazon", "flipkart", "gambol", "nike", "adidas", "asics"];
 
-async function productMatching(brands, projectId, category, destination = "nahdi") {
+async function productMatching(brands, projectId, category, destination = "nahdi", brandName = null) {
     try {
 
         console.log("Starting product matching for brand:", brands.join(", "), "and projectId:", projectId, "and category:", category || "All", "and destination:", destination);
@@ -669,7 +669,9 @@ async function productMatching(brands, projectId, category, destination = "nahdi
         const sourceProducts = await ScratchProducts.findAll({
             where: {
                 asin: { [Op.in]: brands.map(itm => itm.toString()) },
-                projectId: projectId
+                projectId: projectId,
+                // Optional: only that brand's rows (any case), e.g. "Nike".
+                ...(brandName && { brand: { [Op.iLike]: brandName } })
             },
             // limit: 1,
             raw: true,
@@ -677,7 +679,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
         });
 
         if (sourceProducts.length === 0) {
-            throw new Error(`No source rows found for projectId ${projectId} and the ${brands.length} ASIN(s) given.`);
+            throw new Error(`No source rows found for projectId ${projectId}${brandName ? `, brand "${brandName}"` : ""} and the ${brands.length} ASIN(s) given.`);
         }
 
         const brand = sourceProducts[0].brand;
@@ -1164,11 +1166,13 @@ app.use(express.urlencoded({ extended: true }));
 const config = require("./config.json");
 const { Op } = require('sequelize');
 
-// Body: { brand: [<source SKUs>], projectId, category?, destination? }.
+// Body: { brand: [<source ASINs>], projectId, category?, destination?, brandName? }.
+// `brandName`, if given, keeps only the rows of that brand (case ignored).
 // `destination` is the marketplace searched for each source product — "nahdi"
 // (default) or "mumzworld".
 app.post('/product-matching', async (req, res) => {
     const { brand, projectId, category, destination = "nahdi" } = req.body;
+    const brandName = typeof req.body.brandName === "string" && req.body.brandName.trim() ? req.body.brandName.trim() : null;
     console.log(brand)
     if (!brand || brand.length == 0 || !projectId) {
         return res.status(400).json({ error: "Brand and projectId are required parameters." });
@@ -1182,7 +1186,7 @@ app.post('/product-matching', async (req, res) => {
 
         res.status(200).json({ message: "Product matching started successfully." });
 
-        await timing.withTimingContext(() => productMatching(brand, projectId, category, destination));
+        await timing.withTimingContext(() => productMatching(brand, projectId, category, destination, brandName));
 
         console.log("Product matching completed successfully.");
     } catch (error) {
