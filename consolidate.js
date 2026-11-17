@@ -18,10 +18,25 @@ const zlib = require("zlib");
 const sendUpdateReportEmail = require("./helper/sendUpdateReport.js");
 const config = require("./config.json");
 
-const PROJECT = 353;
+const PROJECT = parseInt(process.env.PROJECT || "353", 10);
 const TOTAL = parseInt(process.env.PROJECT_TOTAL || "2852", 10);
 const TO = process.env.REPORT_EMAIL || "jaineel@mergekart.com";
 const GMAIL_LIMIT = 24 * 1024 * 1024; // leave headroom under Gmail's ~25MB
+
+// Every destination label that can appear at the head of a timing log, mapped
+// to its destination id. The output filenames carry the BRAND, not the
+// destination, so the run id is the only link between a file and its target.
+const DEST_LABELS = [
+  [/Nykaa Fashion/, "nykaafashion"],
+  [/Myntra/, "myntra"],
+  [/Foot Locker/, "footlocker"],
+  [/Puma India/, "puma"],
+  [/TechnoSport/, "technosport"],
+  [/Speedo India/, "speedo"],
+  [/New Balance/, "newbalance"],
+  [/Mumzworld/, "mumzworld"],
+  [/Nahdi/, "nahdi"],
+];
 
 // runId -> destination, from the timing logs
 const destOf = {};
@@ -29,12 +44,33 @@ for (const n of fs.readdirSync("logs")) {
   const m = n.match(/^timing_.*_(\d+)\.log$/);
   if (!m) continue;
   const head = fs.readFileSync("logs/" + n, "utf8").slice(0, 400);
-  if (/Nykaa Fashion/.test(head)) destOf[m[1]] = "nykaafashion";
-  else if (/Myntra/.test(head)) destOf[m[1]] = "myntra";
-  else if (/Foot Locker/.test(head)) destOf[m[1]] = "footlocker";
+  const hit = DEST_LABELS.find(([re]) => re.test(head));
+  if (hit) destOf[m[1]] = hit[1];
 }
 
-const DESTS = ["nykaafashion", "myntra", "footlocker"];
+// Only the destinations this project actually produced output for, so an empty
+// section is not reported for a target that was never run.
+const DESTS = process.env.DESTS
+  ? process.env.DESTS.split(",").map((s) => s.trim()).filter(Boolean)
+  : [...new Set(Object.values(destOf))];
+
+// WHICH FIELD IDENTIFIES A ROW.
+//
+// Project 353 holds one row per product, so `sku` is the identity and
+// de-duplicating on it is correct.
+//
+// Project 360 holds one row PER VARIATION — 810 Puma rows across 275 skus,
+// 433 Technosport across 52, 183 New Balance across 38 — distinguished only by
+// `asin`. De-duplicating those on `sku` would silently collapse 810 rows to
+// 275 and discard every size but one, so the key is `asin` when the rows carry
+// one.
+function rowKey(entry) {
+  const src = entry && entry.sourceProduct;
+  if (!src) return null;
+  const asin = src.asin == null ? "" : String(src.asin).trim();
+  if (asin) return asin;
+  return src.sku == null ? null : String(src.sku);
+}
 
 function progressCount(dest) {
   const file = `progress_${PROJECT}_${dest}.jsonl`;
@@ -45,7 +81,11 @@ function progressCount(dest) {
     if (!line.trim()) continue;
     try {
       const row = JSON.parse(line);
-      if (row && row.sku != null) skus.add(String(row.sku));
+      // Count VARIATIONS, not skus: the ledger carries `asin` per row for
+      // project 360, where one sku spans many sizes. Counting skus there
+      // under-reports progress by ~3x.
+      if (row && row.asin != null) skus.add(String(row.asin));
+      else if (row && row.sku != null) skus.add(String(row.sku));
     } catch (err) {
       // Tolerate a torn final line while a run is appending.
     }
@@ -65,13 +105,19 @@ function collect(prefix) {
   let skipped = 0;
   for (const f of files) {
     const dest = destOf[String(f.t)];
-    if (!dest) { skipped++; continue; }
+    // Skip a file whose destination is not in DESTS: the timing logs cover
+    // every run ever done in this directory, so a run id can map to a
+    // destination this consolidation is not reporting on, and indexing
+    // out[dest] for it throws.
+    if (!dest || !out[dest]) { skipped++; continue; }
     let arr;
     try { arr = JSON.parse(fs.readFileSync(f.n, "utf8")); } catch (e) { continue; }
     for (const e of arr) {
-      const sku = e && e.sourceProduct && e.sourceProduct.sku;
-      if (sku == null) continue;
-      out[dest].set(String(sku), e);
+      // Keyed per VARIATION where the rows have one (project 360), else per
+      // sku (project 353). See rowKey().
+      const key = rowKey(e);
+      if (key == null) continue;
+      out[dest].set(key, e);
     }
   }
   return { out, files: files.length, skipped };
@@ -89,13 +135,13 @@ function collectErrors() {
 
   for (const f of files) {
     const dest = destOf[String(f.t)];
-    if (!dest) continue;
+    if (!dest || !out[dest]) continue;
     let arr;
     try { arr = JSON.parse(fs.readFileSync(f.n, "utf8")); } catch (e) { continue; }
     for (const e of arr) {
-      const sku = e && e.sourceProduct && e.sourceProduct.sku;
-      if (sku == null) continue;
-      out[dest].set(String(sku) + "||" + String(e.error || ""), e);
+      const key = rowKey(e);
+      if (key == null) continue;
+      out[dest].set(key + "||" + String(e.error || ""), e);
     }
   }
   return { out, files: files.length };
@@ -198,6 +244,22 @@ notes.push(`Total attachment size: ${(total / 1048576).toFixed(2)} MB`);
 
   if (batches.length > 1) {
     console.log(`\nTotal ${(total / 1048576).toFixed(2)} MB exceeds the limit - sending ${batches.length} emails so every file is delivered`);
+  }
+
+  // DRY_RUN=1 builds the consolidated files and prints the notes, but sends
+  // nothing. Worth having: emailing is not undoable, and a de-duplication key
+  // that is wrong for the project silently drops rows (keying project 360 on
+  // `sku` instead of `asin` turns Puma's 810 variation rows into 275). Check
+  // the counts below against the expected totals before sending.
+  if (process.env.DRY_RUN === "1") {
+    console.log("\n=== DRY RUN - nothing emailed ===");
+    console.log(notes.join("\n"));
+    console.log("\nwould attach:");
+    for (const a of attachments) {
+      console.log(`  ${a.filename} (${(fs.statSync(a.path).size / 1048576).toFixed(2)} MB)`);
+    }
+    console.log(`\nwould send ${batches.length} email(s) to ${TO}`);
+    return;
   }
 
   for (let i = 0; i < batches.length; i++) {
