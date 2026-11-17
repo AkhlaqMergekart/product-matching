@@ -682,6 +682,13 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
         const brand = sourceProducts[0].brand;
 
+        // SKUs sent that have no row in this project (wrong SKU, or the
+        // table not loaded yet) used to vanish without a word: a run of 700+
+        // SKUs ran 6 and said nothing about the rest. They're now counted in
+        // the timing log and listed in the error file.
+        const foundSkus = new Set(sourceProducts.map((row) => String(row.sku)));
+        const missingSkus = [...new Set(brands.map((sku) => String(sku)))].filter((sku) => !foundSkus.has(sku));
+
         // Project 360 holds one row per SKU and size, so a SKU's rows all run
         // the same search. Each search is paid ScrapeOps requests (Nike ~11,
         // adidas up to 11 at ~12s each), so a run asks once per query and
@@ -701,8 +708,14 @@ async function productMatching(brands, projectId, category, destination = "nahdi
         const emptyFilePath = `emptyFile.json`
         const timingFilePath = timing.startRun(
             timing.timingLogPath(`${sourceProducts[0].brand}_${projectId}_${destination}_${Date.now()}`),
-            `${targetConfig.label} matching for brand ${brand}, project ${projectId}, ${sourceProducts.length} SKU(s)`
+            `${targetConfig.label} matching for brand ${brand}, project ${projectId}, ` +
+            `${sourceProducts.length} row(s) for ${foundSkus.size} of the ${brands.length} SKU(s) sent`
         );
+
+        if (missingSkus.length > 0) {
+            timing.logEvent(`${missingSkus.length} SKU(s) sent have no row in project ${projectId} and are not run: ${missingSkus.slice(0, 50).join(", ")}${missingSkus.length > 50 ? ", ..." : ""}`);
+            await appendToFile(errorFilePath, { error: `No source row in project ${projectId}`, missingSkus });
+        }
 
         for (var x = 0; x < sourceProducts.length; x++) {
 
