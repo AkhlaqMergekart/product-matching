@@ -1967,6 +1967,11 @@ const targetSites = {
     // the occasional miss.
     detailFetchConcurrency: 2,
 
+    // Sizes live on the PRODUCT PAGE here (suggest.json ships `variants: []`),
+    // so the variant filter runs after scoring, against the top candidates
+    // whose detail has been fetched. Apparel: no US/UK conversion needed.
+    variantMatching: { needsDetail: true },
+
     // Title with the brand removed and the audience code expanded.
     buildQuery: buildSpeedoQuery,
     // Model name only, for when Shopify's AND-ing of a long title returns

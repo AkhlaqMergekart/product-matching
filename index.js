@@ -15,7 +15,13 @@ const { parseSpeedoAsin, styleCodeInHandle } = require("./helper/speedoSourceTit
 const { parseNewBalanceAsin, styleCodeMatches } = require("./helper/newBalanceSourceTitle.js");
 // Reads the feed's own `variant` column (scale + age ranges), preferred over
 // re-deriving the size from the asin suffix. See helper/sourceVariant.js.
-const { parseSourceVariant, variantAvailable, variantMatchesLabel } = require("./helper/sourceVariant.js");
+// Size-variant matching, taken from the amazon-flipkart-destinations branch.
+// It parses BOTH sides into size TOKENS (shoe{system,value} / alpha / age /
+// num / one) instead of comparing strings, so it understands size systems,
+// half sizes ("US10H" = 10.5), two-size bands ("L/XL") and free size, and can
+// convert US<->UK with a per-brand chart. Strictly more capable than the
+// string comparison this branch used before.
+const { pickVariant, productGender } = require("./helper/sizeVariants.js");
 const { saveHtml } = require("./helper/htmlCache.js");
 const timing = require("./helper/timingLogger.js");
 const targetSites = require("./config/targetSites.js");
@@ -601,6 +607,14 @@ function toText(value) {
 // to decide.
 function withStringTextFields(product) {
     const copy = { ...product };
+
+    // The size list and the picked variant are for the RESULT FILES, not for
+    // the service: it compares the size through `model` instead (see
+    // selectSourceVariant). Sending them would bloat every request with the
+    // full size table of every candidate.
+    delete copy.variants;
+    delete copy.destinationVariant;
+    if (copy.model != null) copy.model = toText(copy.model);
     for (const field of MATCH_TEXT_FIELDS) {
         if (copy[field] == null) {
             // The service's schema types these as required strings, so a null
@@ -729,6 +743,72 @@ function sourceVariationOf(sourceProduct, destination) {
         size,
         // False for accessories, whose asin is the bare sku with no suffix.
         hasSize: Boolean(size),
+    };
+}
+
+// For a source row with a `variant` (project 360: "l", "uk-8", "us-8-5",
+// "7-8-y", "32"), keeps only the candidates that come in that size, each
+// carrying the size it was matched to as `destinationVariant`.
+//
+// This REPLACES the earlier approach of keeping every candidate and tagging it
+// pass/fail. Filtering is the better behaviour: a candidate the source's size
+// is not sold in cannot be the match, and leaving it in the output invited the
+// reading that a different product "matched on size".
+//
+// The size also goes to the matching service as `model` on both sides, so the
+// model score reflects size agreement. For a converted shoe size the source
+// size is kept in brackets ("UK 9 (us-10)") so the comparison is still fair.
+//
+// Only targets declaring `variantMatching` take part; everything else keeps
+// every candidate exactly as before.
+function selectSourceVariant(targetConfig, sourceProduct, candidates) {
+    const wanted = String(sourceProduct.variant || "").trim();
+    if (!wanted || !targetConfig.variantMatching) {
+        return { source: sourceProduct, candidates, skipped: [], sourceVariant: wanted };
+    }
+
+    const options = { ...targetConfig.variantMatching, gender: productGender(sourceProduct) };
+    const kept = [];
+    const skipped = [];
+
+    for (const candidate of candidates) {
+        // pickVariant reads `label`; the extractors on this branch emit the
+        // size as `size` ({size, sku, available, price, mrp}). Normalised here
+        // rather than rewriting four extractors — and `label` is kept when a
+        // target already supplies it, so a reference-shaped target still works.
+        const variantList = (Array.isArray(candidate.variants) ? candidate.variants : [])
+            .map((v) => (v && v.label != null ? v : { ...v, label: v && v.size }));
+
+        // Sizes can also arrive from the DETAIL payload rather than the search
+        // payload (Speedo's suggest.json ships `variants: []`), so fall back to
+        // that before concluding the product has no sizes at all.
+        const detailVariants = candidate.detail && !candidate.detail.error && Array.isArray(candidate.detail.variants)
+            ? candidate.detail.variants.map((v) => (v && v.label != null ? v : { ...v, label: v && v.size }))
+            : [];
+
+        const variant = pickVariant(wanted, variantList.length ? variantList : detailVariants, options);
+        if (!variant) {
+            skipped.push({
+                sku: candidate.sku,
+                title: candidate.title,
+                url: candidate.url,
+                sizes: (candidate.variants || []).map((v) => v.label),
+            });
+            continue;
+        }
+        kept.push({
+            ...candidate,
+            model: variant.matchType === "converted" ? `${variant.label} (${wanted})` : variant.label,
+            destinationVariant: variant,
+        });
+    }
+
+    timing.logEvent(`Variant "${wanted}" (${options.gender}): on ${kept.length}/${candidates.length} candidate(s)`);
+    return {
+        source: { ...sourceProduct, model: wanted },
+        candidates: kept,
+        skipped,
+        sourceVariant: wanted,
     };
 }
 
@@ -1577,13 +1657,57 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
             console.log("Found products in batch:", productBatches.length);
 
+            // Keep only the candidates sold in the source row's size, each
+            // tagged with the size it matched (`destinationVariant`).
+            //
+            // Runs BEFORE the matching service only where the search payload
+            // already carries sizes (technosport's `availablesize`, New
+            // Balance's `variantData`). Speedo and Puma publish sizes only on
+            // the product page, so for them this pass sees nothing to match on
+            // and every candidate would be dropped — there the selection is
+            // applied AFTER scoring, against the top candidates that have had
+            // their detail fetched. `variantMatching.needsDetail` says which.
+            const deferVariant = Boolean(targetConfig.variantMatching && targetConfig.variantMatching.needsDetail);
+
+            const variantSelection = deferVariant
+                ? { source: sourceProduct, candidates: productBatches, skipped: [], sourceVariant: String(sourceProduct.variant || "").trim() }
+                : selectSourceVariant(targetConfig, sourceProduct, productBatches);
+            const sourceVariant = variantSelection.sourceVariant;
+            const candidatesForMatching = variantSelection.candidates;
+
+            // Every candidate was dropped for not coming in this size. That is
+            // a finding in its own right, not an empty search: the products
+            // exist, they just are not sold in the size this row holds.
+            if (candidatesForMatching.length === 0) {
+                console.log(`Variant "${sourceVariant}" not available on any candidate for:`, sourceProduct.title);
+                timing.logEvent(`Result: variant "${sourceVariant}" not available on any of the ${productBatches.length} candidate(s)`);
+                await appendToFile(errorFilePath, {
+                    sourceProduct: sourceProduct,
+                    sourceVariant,
+                    error: `Variant "${sourceVariant}" not available on any candidate`,
+                    candidatesWithoutVariant: variantSelection.skipped,
+                });
+                await appendToFile(outputFilePath, {
+                    sourceProduct: sourceProduct,
+                    sourceVariant,
+                    destinationVariant: null,
+                    matchedProducts: {},
+                });
+                recordProgress(projectId, destination, sourceProduct.sku, "no-variant", {
+                    asin: sourceProduct.asin,
+                    variant: sourceVariant,
+                    candidates: productBatches.length,
+                });
+                continue;
+            }
+
             let matchData = [];
             try {
                 // The enrich callback fetches a candidate's product-page detail;
                 // callMatchingService runs these concurrently with the image pass
                 // and attaches the result to each top candidate as `.detail`.
                 matchData = await callMatchingService(
-                    sourceProduct, productBatches,
+                    variantSelection.source, candidatesForMatching,
                     (product) => enrichMatchedProduct(
                         targetConfig, product, sourceProduct.sku,
                         `candidate-${product && product.sku}`
@@ -1627,6 +1751,72 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
             console.log("Match data found:", matchData.length);
 
+            // DEFERRED variant selection (speedo, puma): their sizes live on
+            // the product page, which is only fetched for the top
+            // DETAIL_ENRICH_TOP_N candidates — so the filter runs here, on the
+            // scored list, rather than before the service where no candidate
+            // had sizes yet.
+            //
+            // Scoped to the top N deliberately: fetching detail for all 10-24
+            // candidates to filter them would cost 3-5x the run time against a
+            // host that already rate-limits (Speedo returned HTTP 429 at a
+            // concurrency of 5). Candidates below the cut-off keep no
+            // destinationVariant, which reads as "not checked", not "no size".
+            if (deferVariant && sourceVariant) {
+                const checked = matchData.slice(0, DETAIL_ENRICH_TOP_N);
+                const options = { ...targetConfig.variantMatching, gender: productGender(sourceProduct) };
+                const kept = [];
+                const skippedNow = [];
+
+                for (const entry of checked) {
+                    const d = entry.detail;
+                    const list = d && !d.error && Array.isArray(d.variants)
+                        ? d.variants.map((v) => (v && v.label != null ? v : { ...v, label: v && v.size }))
+                        : [];
+                    const variant = list.length ? pickVariant(sourceVariant, list, options) : null;
+
+                    if (!variant) {
+                        skippedNow.push({
+                            sku: entry.product && entry.product.sku,
+                            title: entry.product && entry.product.title,
+                            url: entry.product && entry.product.url,
+                            sizes: list.map((v) => v.label),
+                        });
+                        continue;
+                    }
+                    kept.push({
+                        ...entry,
+                        product: { ...entry.product, destinationVariant: variant },
+                    });
+                }
+
+                timing.logEvent(`Variant "${sourceVariant}" (${options.gender}): on ${kept.length}/${checked.length} of the top ${DETAIL_ENRICH_TOP_N} candidate(s)`);
+                variantSelection.skipped = skippedNow;
+                matchData = kept;
+
+                if (matchData.length === 0) {
+                    console.log(`Variant "${sourceVariant}" not available on any of the top candidates for:`, sourceProduct.title);
+                    await appendToFile(errorFilePath, {
+                        sourceProduct: sourceProduct,
+                        sourceVariant,
+                        error: `Variant "${sourceVariant}" not available on any candidate`,
+                        candidatesWithoutVariant: skippedNow,
+                    });
+                    await appendToFile(outputFilePath, {
+                        sourceProduct: sourceProduct,
+                        sourceVariant,
+                        destinationVariant: null,
+                        matchedProducts: {},
+                    });
+                    recordProgress(projectId, destination, sourceProduct.sku, "no-variant", {
+                        asin: sourceProduct.asin,
+                        variant: sourceVariant,
+                        candidates: checked.length,
+                    });
+                    continue;
+                }
+            }
+
             // callMatchingService has already enriched the top N candidates
             // (concurrently with the image pass) and attached `.detail` to each.
             // Index them by sku so the winner below can reuse its detail rather
@@ -1650,47 +1840,40 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             // identical — same sku, same title, same colourway — with the size
             // only in `asin` ("10927703-7"). Without this the 7 size-rows of a
             // shoe are indistinguishable in the output.
-            const srcVariation = sourceVariationOf(sourceProduct, destination);
-
             // The matching service ECHOES BACK only the fields its own Product
-            // model declares, so the variation fields a site extractor added —
-            // `color`, `styleCode`, `availableSizes` — are absent from
-            // `entry.product`. Matching against that echo therefore sees no
-            // colour at all and reports every candidate as a non-match.
-            //
-            // `productBatches` holds the candidates as the extractor built
-            // them, so the variation match is made against those, looked up by
-            // the sku that survives the round trip.
+            // model declares, so everything a site extractor added —
+            // `variants`, `destinationVariant`, `color`, `styleCode` — is
+            // absent from `entry.product`. `productBatches` holds the
+            // candidates as built, so those fields are restored here, looked
+            // up by the sku that survives the round trip.
             const originalBySku = new Map();
-            for (const cand of productBatches) {
+            for (const cand of candidatesForMatching) {
                 if (cand && cand.sku != null) originalBySku.set(String(cand.sku), cand);
             }
-            // `detail` is attached to the SCORED ENTRY, not to `entry.product`,
-            // so it has to be carried onto the original explicitly — otherwise
-            // a destination whose sizes only exist in the detail payload
-            // (Speedo: suggest.json ships `variants: []`) can never see them,
-            // and reports "size unknown" for every candidate even after the
-            // product JSON was fetched successfully.
-            const originalOf = (product, detail) => {
-                const key = product && product.sku != null ? String(product.sku) : "";
-                const base = originalBySku.get(key) || product;
-                if (detail === undefined) return base;
-                return { ...base, detail };
+
+            // Puts `destinationVariant` back on each candidate's product, which
+            // is where the report format carries it:
+            //   matchedProducts[].product.destinationVariant
+            //     { label, sku, inStock, matchType }
+            const withVariant = (entry) => {
+                const sku = entry && entry.product && entry.product.sku;
+                const original = sku != null ? originalBySku.get(String(sku)) : null;
+                if (!original || original.destinationVariant === undefined) return entry;
+                return {
+                    ...entry,
+                    product: { ...entry.product, destinationVariant: original.destinationVariant },
+                };
             };
 
             await appendToFile(matchedFilePath, {
                 sourceProduct: sourceProduct,
-                sourceVariation: srcVariation,
-                matchedProducts: matchData.map((entry, rank) => ({
-                    ...entry,
-                    rank: rank + 1,
-                    modelScore: modelScoreOf(entry),
-                    // Which candidate is the RIGHT colour and size. The model
-                    // cannot tell two colourways of one product apart (their
-                    // titles differ by one word), so this is the field that
-                    // picks the variation the source row actually names.
-                    variationMatch: variationMatchOf(srcVariation, originalOf(entry.product, entry.detail), destination),
-                })),
+                sourceVariant,
+                matchedProducts: matchData.map(withVariant),
+                // The candidates dropped because the source's size is not sold
+                // in them. Recorded rather than discarded: "this product does
+                // not come in a 34" is a finding, and without it a short
+                // candidate list looks like a thin search instead.
+                ...(variantSelection.skipped.length > 0 && { candidatesWithoutVariant: variantSelection.skipped }),
             });
 
             let foundProductCount = 0;
@@ -1715,14 +1898,17 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                                 `candidate-${winnerSku}`
                             );
 
+                        const winner = withVariant(matchData[i]);
+
                         const finalObj = {
                             sourceProduct: sourceProduct,
-                            sourceVariation: srcVariation,
-                            matchedProducts: matchData[i],
+                            sourceVariant,
+                            // The destination size this row was matched to,
+                            // lifted to the top level so the final file states
+                            // the pairing without walking into matchedProducts.
+                            destinationVariant: winner.product?.destinationVariant || null,
+                            matchedProducts: winner,
                             matchedDetail: matchedDetail,
-                            // Whether the WINNER is the right colour/size, not
-                            // merely the best-scoring text match.
-                            variationMatch: variationMatchOf(srcVariation, originalOf(matchData[i].product, matchedDetail), destination),
                             // The winner's scores, flat. Same shape as the
                             // per-candidate modelScore above, so the final file
                             // and the all-candidates file can be read the same
@@ -1760,17 +1946,20 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                 foundProductCount === 0 ? "no-match" : "matched",
                 foundProductCount === 0 ? {
                     asin: sourceProduct.asin,
-                    size: srcVariation.size,
-                    colourToken: srcVariation.colourToken || undefined,
-                    candidates: productBatches.length,
+                    variant: sourceVariant || undefined,
+                    candidates: candidatesForMatching.length,
                     // The best composite reached, so a near-miss is visible in
                     // the ledger without opening the output files.
                     bestComposite: matchData[0] ? (matchData[0].composite_score ?? null) : null,
                 } : {
                     asin: sourceProduct.asin,
-                    size: srcVariation.size,
-                    colourToken: srcVariation.colourToken || undefined,
-                    candidates: productBatches.length,
+                    variant: sourceVariant || undefined,
+                    // The destination size the winner was matched to, so the
+                    // ledger alone answers "which size did it pair with".
+                    destinationVariant: (matchedEntry && matchedEntry.product
+                        && matchedEntry.product.destinationVariant
+                        && matchedEntry.product.destinationVariant.label) || undefined,
+                    candidates: candidatesForMatching.length,
                     matchedTitle: (matchedEntry && matchedEntry.product && matchedEntry.product.title) || "",
                     matchedUrl: (matchedEntry && matchedEntry.product && matchedEntry.product.url) || "",
                     composite: matchedEntry ? matchedEntry.composite_score : null,
@@ -1796,7 +1985,8 @@ async function productMatching(brands, projectId, category, destination = "nahdi
 
                 await appendToFile(outputFilePath, {
                     sourceProduct: sourceProduct,
-                    sourceVariation: srcVariation,
+                    sourceVariant,
+                    destinationVariant: null,
                     matchedProducts: {},
                     modelScore: modelScoreOf(best),
                     bestCandidate: best && best.product ? {
