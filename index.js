@@ -13,6 +13,9 @@ const { sourceSizeFromAsin } = require("./helper/pumaSourceTitle.js");
 const { parseTechnosportAsin, colourMatches, sizeIsAvailable } = require("./helper/technosportSourceTitle.js");
 const { parseSpeedoAsin, styleCodeInHandle } = require("./helper/speedoSourceTitle.js");
 const { parseNewBalanceAsin, styleCodeMatches } = require("./helper/newBalanceSourceTitle.js");
+// Reads the feed's own `variant` column (scale + age ranges), preferred over
+// re-deriving the size from the asin suffix. See helper/sourceVariant.js.
+const { parseSourceVariant, variantAvailable, variantMatchesLabel } = require("./helper/sourceVariant.js");
 const { saveHtml } = require("./helper/htmlCache.js");
 const timing = require("./helper/timingLogger.js");
 const targetSites = require("./config/targetSites.js");
@@ -687,16 +690,33 @@ function sourceVariationOf(sourceProduct, destination) {
 
     if (destination === "speedo") {
         const v = parseSpeedoAsin(asin, sku);
+
+        // Prefer the feed's OWN `variant` column over re-deriving the size
+        // from the asin. Measured over the 313 Speedo rows: the two agree on
+        // 201, are both empty on 62 (one-size items), and differ on 50 — every
+        // one a kids size where the column holds the RANGE Speedo actually
+        // sells ("7-8-y") and the asin only a single year ("07Y").
+        //
+        // The asin parse stays as the fallback, for a row whose column is
+        // empty but whose asin does carry a suffix.
+        const col = parseSourceVariant(sourceProduct);
+        const size = col.size || v.size;
+
         return {
             asin,
             sku,
-            // "04Y" normalised to "4Y"; numeric sizes (22-48) left as written.
-            size: v.size,
-            hasSize: v.hasSize,
-            // 62 of the 313 rows are one-size items (caps, goggles, earplugs)
-            // whose asin IS the bare sku. Stated so an absent size reads as
-            // "this product has no size" rather than a parse failure.
-            oneSize: !v.hasSize,
+            size,
+            // What the feed published, kept alongside the normalised form so
+            // an output row shows the source's own wording.
+            variantRaw: col.raw,
+            variantKind: col.kind,
+            ageFrom: col.ageFrom,
+            ageTo: col.ageTo,
+            hasSize: Boolean(size),
+            // 62 of the 313 rows are one-size items (caps, goggles, earplugs):
+            // no `variant` and no asin suffix. Stated so an absent size reads
+            // as "this product has no size" rather than a parse failure.
+            oneSize: !size,
         };
     }
 
@@ -804,23 +824,21 @@ function variationMatchOf(sourceVariation, candidate, destination) {
             }
             return [];
         })();
-        const sizeOk = detailSizes.length === 0
-            ? null
-            : detailSizes.some((label) => {
-                const l = String(label).trim().toUpperCase();
-                const w = wantSize.toUpperCase();
-                if (!w) return false;
-                if (l === w) return true;
-                // leading numeric/letter token of "24 (5-6Y)"
-                const head = l.split(/[\s(]/)[0];
-                if (head === w) return true;
-                // the age range in brackets, against a "<n>Y" source size
-                const years = /^(\d{1,2})Y$/.exec(w);
-                const range = /\((\d{1,2})\s*-\s*(\d{1,2})Y\)/.exec(l);
-                return Boolean(years && range
-                    && Number(years[1]) >= Number(range[1])
-                    && Number(years[1]) <= Number(range[2]));
-            });
+        // Compared through the shared variant reader, so the source's own
+        // `variant` value (including an age RANGE like "7-8Y" and a scale like
+        // "UK 7") is matched against the destination's label, rather than the
+        // single-age approximation the asin parse produced.
+        const sizeOk = variantAvailable(
+            { size: wantSize, ageFrom: sourceVariation.ageFrom, ageTo: sourceVariation.ageTo },
+            detailSizes,
+        );
+
+        // Which label actually covered it — so the output names the matched
+        // variant instead of only asserting that one exists.
+        const matchedLabel = detailSizes.find((label) => variantMatchesLabel(
+            { size: wantSize, ageFrom: sourceVariation.ageFrom, ageTo: sourceVariation.ageTo },
+            label,
+        )) || "";
 
         return {
             styleCodeMatch: codeOk,
@@ -832,8 +850,33 @@ function variationMatchOf(sourceVariation, candidate, destination) {
             // there is no size to agree about.
             exact: codeOk && (sourceVariation.oneSize ? true : sizeOk === true),
             wantSize,
+            // What the feed published for this row, so the output carries the
+            // source's own wording next to the normalised comparison value.
+            wantVariantRaw: sourceVariation.variantRaw || "",
             availableSizes: detailSizes,
             handle: String(candidate.handle || ""),
+            // WHICH destination variant matched — the thing a reader actually
+            // needs. Without it `sizeAvailable: true` says only "a size exists
+            // that covers ours" and the variant has to be re-derived by hand
+            // from detail.variants[].
+            matchedVariant: (() => {
+                if (!matchedLabel) return null;
+                const d = candidate.detail;
+                const v = d && !d.error && Array.isArray(d.variants)
+                    ? d.variants.find((x) => String(x.size || "").trim() === matchedLabel)
+                    : null;
+                return {
+                    size: matchedLabel,
+                    // The destination's own variant id, which is what uniquely
+                    // names the variation on its side.
+                    sku: v ? String(v.sku || "") : "",
+                    price: v ? v.price : null,
+                    mrp: v ? v.mrp : null,
+                    // null where the payload does not state it (Shopify's
+                    // .json omits `available`), not a guess at "in stock".
+                    available: v ? v.available : null,
+                };
+            })(),
         };
     }
 
@@ -1336,7 +1379,7 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             },
             // limit: 1,
             raw: true,
-            attributes: ['title', 'url', 'brand', 'sku', 'asin', 'category', 'images', 'attributes', 'price', 'mrp']
+            attributes: ['title', 'url', 'brand', 'sku', 'asin', 'category', 'images', 'attributes', 'price', 'mrp', 'variant']
         });
 
         const brand = sourceProducts[0].brand;
@@ -1860,7 +1903,7 @@ async function runBrandMatching(brandName, projectId, skus = null) {
     const localCatalog = await ScratchProducts.findAll({
         where,
         raw: true,
-        attributes: ['title', 'url', 'brand', 'sku', 'asin', 'category', 'images', 'attributes', 'price', 'mrp']
+        attributes: ['title', 'url', 'brand', 'sku', 'asin', 'category', 'images', 'attributes', 'price', 'mrp', 'variant']
     });
 
     if (localCatalog.length === 0) {
