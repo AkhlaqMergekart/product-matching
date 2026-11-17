@@ -110,9 +110,15 @@ const PERMANENT_STATUSES = new Set([404, 410]);
 class PermanentHttpError extends Error {}
 
 // One attempt. Throws on anything that should cost us this IP.
-async function attempt(url, { headers, timeout, expectJson, mustContain, retryStatuses }) {
+async function attempt(url, { headers, timeout, expectJson, mustContain, retryStatuses, method, data }) {
   const response = await axios.request({
-    method: "get",
+    // GET unless the caller asks otherwise. A JSON search API may require a
+    // POST with the query in the BODY — New Balance's Algolia index does, and
+    // its GET form answers 403 — so silently forcing GET made that endpoint
+    // unreadable. `data` is only sent when a method that carries a body is
+    // requested, so every existing GET caller is unaffected.
+    method: method ? String(method).toLowerCase() : "get",
+    ...(data !== undefined && method && /^(post|put|patch)$/i.test(method) ? { data } : {}),
     url,
     httpsAgent: getAgent(),
     // Tell axios not to apply its own proxy handling on top of the agent —
@@ -172,6 +178,11 @@ async function fetchWithRotation(url, options, expectJson) {
         expectJson,
         mustContain: options.mustContain,
         retryStatuses: new Set(options.retryStatuses || []),
+        // Forwarded so a POST search API works through the proxy + retry path
+        // like any other fetch. Absent for every existing caller, which keeps
+        // the GET default.
+        method: options.method,
+        data: options.data,
       });
     } catch (err) {
       lastError = err;

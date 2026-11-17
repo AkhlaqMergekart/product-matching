@@ -12,6 +12,7 @@ const { withFetchableImages } = require("./helper/sourceImages.js");
 const { sourceSizeFromAsin } = require("./helper/pumaSourceTitle.js");
 const { parseTechnosportAsin, colourMatches, sizeIsAvailable } = require("./helper/technosportSourceTitle.js");
 const { parseSpeedoAsin, styleCodeInHandle } = require("./helper/speedoSourceTitle.js");
+const { parseNewBalanceAsin, styleCodeMatches } = require("./helper/newBalanceSourceTitle.js");
 const { saveHtml } = require("./helper/htmlCache.js");
 const timing = require("./helper/timingLogger.js");
 const targetSites = require("./config/targetSites.js");
@@ -415,7 +416,17 @@ async function buildCandidatesFromSearchApi(targetConfig, query) {
     // credentials travel in headers, but the query is what's worth reading.
     const response = await timing.step(
         `${targetConfig.label} search API`,
-        () => fetchJson(api.buildUrl(query), { headers: api.headers() }),
+        // A target may need a POST with a JSON body rather than a GET with the
+        // query in the URL. New Balance's Algolia index is the case this
+        // exists for: /1/indexes/*/queries takes the query in the body, and
+        // the GET /1/indexes/<name>?query=... form answers HTTP 403 for its
+        // public key — so a GET-only client simply cannot read it.
+        () => fetchJson(api.buildUrl(query), {
+            headers: api.headers(),
+            ...(api.method === "POST"
+                ? { method: "POST", data: api.buildBody(query) }
+                : {}),
+        }),
         { detail: query, summarize: (r) => `${api.extractHits(r).length} result(s)` }
     );
 
@@ -652,6 +663,28 @@ function sourceVariationOf(sourceProduct, destination) {
     // ("81241101224" = "812411012" + "24"), so neither Puma's
     // last-hyphen-segment rule nor Technosport's three-part split applies —
     // the sku has to be stripped by prefix.
+    // New Balance: "<STYLE>-<MID>-<SIZE>" on all 183 rows, but MID is a WIDTH
+    // for footwear (D/B) and a COLOUR CODE for apparel (ABJ/DNT) — and `sku`
+    // equals the style for footwear while concatenating style+colour for
+    // apparel. Neither a startsWith nor a style+mid rule covers both, so the
+    // size is taken as the LAST hyphen segment, which is uniform.
+    if (destination === "newbalance") {
+        const v = parseNewBalanceAsin(asin, sku);
+        return {
+            asin,
+            sku,
+            size: v.size,
+            // Exactly one of these is set, by design: reporting a width as a
+            // colour (or vice versa) would make the output misleading.
+            width: v.width,
+            colourCode: v.colourCode,
+            // The code the destination actually indexes — NOT the sku, which
+            // for apparel has the colour welded on.
+            styleCode: v.styleCode,
+            hasSize: v.hasSize,
+        };
+    }
+
     if (destination === "speedo") {
         const v = parseSpeedoAsin(asin, sku);
         return {
@@ -692,6 +725,52 @@ function sourceVariationOf(sourceProduct, destination) {
 // the field is simply absent rather than misleadingly false.
 function variationMatchOf(sourceVariation, candidate, destination) {
     if (!sourceVariation || !candidate) return null;
+
+    // New Balance: identity is the STYLE CODE, which the index carries as the
+    // colourway key of `styleData` and in the variant id / product URL. The
+    // price term cannot help here at all — the US store quotes USD while the
+    // source rows are INR — so the code is the only trustworthy signal.
+    if (destination === "newbalance") {
+        const wantSize = sourceVariation.size || "";
+        const wantWidth = sourceVariation.width || "";
+        const codeOk = styleCodeMatches(sourceVariation.styleCode, candidate);
+
+        const sizes = Array.isArray(candidate.availableSizes) ? candidate.availableSizes : [];
+        const widths = Array.isArray(candidate.availableWidths) ? candidate.availableWidths : [];
+
+        // The index lists sizes as bare strings ("7.5", "M"); compare
+        // case-insensitively and accept a trailing ".0" difference.
+        const sizeOk = sizes.length === 0
+            ? null
+            : sizes.some((s) => {
+                const a = String(s).trim().toUpperCase();
+                const b = wantSize.toUpperCase();
+                return a === b || a.replace(/\.0$/, "") === b.replace(/\.0$/, "");
+            });
+
+        // Widths read "Standard (M)" / "Wide (W)" on the index against a bare
+        // "D"/"B" in the feed, so a letter inside the brackets counts as a
+        // match. Only meaningful for footwear; null when the row has no width.
+        const widthOk = !wantWidth
+            ? null
+            : (widths.length === 0
+                ? null
+                : widths.some((w) => new RegExp(`\\(${wantWidth}\\)|\\b${wantWidth}\\b`, "i").test(String(w))));
+
+        return {
+            styleCodeMatch: codeOk,
+            colourMatch: null,
+            sizeAvailable: sizeOk,
+            widthAvailable: widthOk,
+            // The code proves the product; the size must also be sold in it.
+            // Width is advisory — the index does not list widths for apparel.
+            exact: codeOk && sizeOk === true,
+            wantSize,
+            wantWidth,
+            availableSizes: sizes,
+            availableWidths: widths,
+        };
+    }
 
     // Speedo: identity comes from the STYLE CODE IN THE HANDLE, not from a
     // field. Its search cannot find the code, but every product URL ends with
@@ -1215,7 +1294,14 @@ function pickBestMatch(matchData) {
 //                  the query — with its audience code expanded ("JM" ->
 //                  "Boy's"), which took the measured hit rate from 55.9% to
 //                  90.2%. See helper/speedoSourceTitle.js.
-const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "myntra", "nykaafashion", "footlocker", "puma", "technosport", "speedo"];
+//   "newbalance" -> www.newbalance.com, the brand's own site on Salesforce
+//                  Demandware + ALGOLIA. Mode S, but a POST search API: the
+//                  query travels in the body, and the GET form answers 403.
+//                  Unlike Speedo the STYLE CODE is searchable, so it is the
+//                  primary query with the model name as the fallback. The US
+//                  store prices in USD while the source rows are INR, so the
+//                  price term cannot score — identity comes from the code.
+const MATCHING_DESTINATIONS = ["nahdi", "mumzworld", "myntra", "nykaafashion", "footlocker", "puma", "technosport", "speedo", "newbalance"];
 
 async function productMatching(brands, projectId, category, destination = "nahdi") {
     try {
@@ -1388,8 +1474,15 @@ async function productMatching(brands, projectId, category, destination = "nahdi
             // Only ever runs when the first query found NOTHING, so it costs
             // one extra fetch on exactly the products that would otherwise
             // have been written off as "No products found".
+            // Applies to SEARCH-API targets too, not just page-scraped ones.
+            // The `!usesSearchApi` guard that used to be here silently disabled
+            // the fallback for every Mode S destination — so New Balance's
+            // three FuelCell codes reported "no products found" on 17 rows
+            // although the model name ("FuelCell Rebel v5") finds them, and
+            // Technosport's and Speedo's fallbacks were never reachable
+            // either. The only difference between the two paths is HOW the
+            // second query is fetched, which is handled below.
             if (productBatches.length === 0
-                && !usesSearchApi
                 && typeof targetConfig.buildFallbackQuery === "function") {
 
                 const fallbackQuery = targetConfig.buildFallbackQuery(sourceProduct);
@@ -1397,24 +1490,28 @@ async function productMatching(brands, projectId, category, destination = "nahdi
                 // Skip when it would repeat the query just tried (a source row
                 // with no colourway parsed out of its title).
                 if (fallbackQuery && fallbackQuery !== searchQuery) {
-                    timing.logEvent(`No candidates for "${searchQuery}" — retrying without the colourway: "${fallbackQuery}"`);
-                    const fallbackUrl = targetConfig.buildSearchUrl(fallbackQuery);
+                    timing.logEvent(`No candidates for "${searchQuery}" — retrying with the broader query: "${fallbackQuery}"`);
 
                     try {
-                        const fallbackHtml = await timing.step(
-                            `${targetConfig.label} search page fetch (fallback query)`,
-                            () => fetchHtml(targetConfig.scraper, fallbackUrl, targetConfig.scraperOptions),
-                            { detail: fallbackUrl, summarize: describeHtml }
-                        );
-                        saveHtml(targetConfig.id, sourceProduct.sku, "search-fallback", fallbackUrl, fallbackHtml);
+                        if (usesSearchApi) {
+                            productBatches = await buildCandidatesFromSearchApi(targetConfig, fallbackQuery);
+                        } else {
+                            const fallbackUrl = targetConfig.buildSearchUrl(fallbackQuery);
+                            const fallbackHtml = await timing.step(
+                                `${targetConfig.label} search page fetch (fallback query)`,
+                                () => fetchHtml(targetConfig.scraper, fallbackUrl, targetConfig.scraperOptions),
+                                { detail: fallbackUrl, summarize: describeHtml }
+                            );
+                            saveHtml(targetConfig.id, sourceProduct.sku, "search-fallback", fallbackUrl, fallbackHtml);
 
-                        const $fb = cheerio.load(fallbackHtml);
-                        const fbDoc = new dom().parseFromString($fb.xml(), 'text/xml');
-                        productBatches = await timing.step(
-                            `${targetConfig.label} candidate collection (fallback query)`,
-                            () => buildCandidatesFromDoc(targetConfig, fbDoc, fallbackQuery),
-                            { summarize: (c) => `${c.length} candidate(s)` }
-                        );
+                            const $fb = cheerio.load(fallbackHtml);
+                            const fbDoc = new dom().parseFromString($fb.xml(), 'text/xml');
+                            productBatches = await timing.step(
+                                `${targetConfig.label} candidate collection (fallback query)`,
+                                () => buildCandidatesFromDoc(targetConfig, fbDoc, fallbackQuery),
+                                { summarize: (c) => `${c.length} candidate(s)` }
+                            );
+                        }
                     } catch (err) {
                         // The fallback is best-effort: a failure here leaves
                         // the original "no products found" outcome intact

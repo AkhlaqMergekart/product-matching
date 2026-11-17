@@ -21,6 +21,12 @@ const {
   buildSpeedoQuery,
   buildSpeedoFallbackQuery,
 } = require("../helper/speedoSourceTitle.js");
+// New Balance's style code IS searchable on its Algolia index (unlike Speedo's),
+// so the code is the primary query and the title the fallback.
+const {
+  buildNewBalanceCodeQuery,
+  buildNewBalanceQuery,
+} = require("../helper/newBalanceSourceTitle.js");
 
 // config.json is the repo's home for deploy-time overrides (see
 // config/proxy.js); a missing file just means "use the defaults".
@@ -2155,6 +2161,187 @@ const targetSites = {
               .map((o) => `${o?.name}: ${(Array.isArray(o?.values) ? o.values : []).join(" / ")}`)
               .join(" | "),
             publishedAt: String(p.published_at || ""),
+          },
+        };
+      },
+    },
+  },
+
+  // www.newbalance.com — the brand's own site, so the brand token is stripped
+  // from the query (and only 93 of the 183 source titles carry it anyway).
+  //
+  // Mode S (searchApi) over SALESFORCE DEMANDWARE + ALGOLIA. The search page
+  // itself ships a single empty `product-tile` and loads results client-side,
+  // so the Algolia index is queried directly. Credentials come from the page's
+  // own `algoliaData` block, which the storefront serves to every visitor.
+  //
+  // THE STYLE CODE IS SEARCHABLE HERE, unlike Speedo's. "MELPS87T" returns an
+  // exact styleID match, so the code is the PRIMARY query and the title is the
+  // fallback — the inverse of the Speedo target. That matters because this
+  // feed's apparel titles are graphic names ("Ramen T-Shirt"), which return
+  // 346 hits on their own.
+  //
+  // ⚠ CURRENCY: this is the US storefront (Sites-NBUS-Site, USD) while the
+  // source rows are INR. The matching service's `price` term (0.15 of the
+  // weight) therefore scores ~0 for every candidate, and the regional
+  // catalogues differ. Identity comes from the style code instead — see
+  // variationMatchOf in index.js.
+  newbalance: {
+    id: "newbalance",
+    label: "New Balance",
+    scraper: "axios",
+    needsDetailFetch: false,
+
+    // Style code first (searchable, and exact), title as the fallback.
+    buildQuery: buildNewBalanceCodeQuery,
+    buildFallbackQuery: buildNewBalanceQuery,
+
+    // Only for the log line; candidates come from the searchApi below.
+    buildSearchUrl: (query) =>
+      `https://www.newbalance.com/search/?sm=search-bar&q=${encodeURIComponent(query)}`,
+
+    searchApi: {
+      // Read from `algoliaData` in the storefront's own HTML
+      // (var algoliaData = {"applicationID":...,"searchApiKey":...}). Public,
+      // search-only credentials, exactly like Mumzworld's below. If New
+      // Balance rotates them, searches start failing with HTTP 403: read the
+      // new pair out of that block and set NEWBALANCE_ALGOLIA_APP_ID /
+      // NEWBALANCE_ALGOLIA_API_KEY (env) or the config.json equivalents.
+      appId: process.env.NEWBALANCE_ALGOLIA_APP_ID
+        || fileConfig.NEWBALANCE_Algolia_App_Id
+        || "2U1A6CX2BS",
+      apiKey: process.env.NEWBALANCE_ALGOLIA_API_KEY
+        || fileConfig.NEWBALANCE_Algolia_Api_Key
+        || "f9b875576c477180e4e0ee113d3c9fef",
+      indexName: "prod_na_us__products__en_US",
+      hitsPerPage: 20,
+
+      // POST to /1/indexes/*/queries, which is what the Algolia JS client
+      // uses. The GET /1/indexes/<name>?query=... form returns HTTP 403 for
+      // this key — verified — so the POST body is not optional here.
+      method: "POST",
+
+      buildUrl() {
+        return `https://${this.appId}-dsn.algolia.net/1/indexes/*/queries`;
+      },
+
+      buildBody(query) {
+        return {
+          requests: [{
+            indexName: this.indexName,
+            query: String(query || ""),
+            hitsPerPage: this.hitsPerPage,
+          }],
+        };
+      },
+
+      headers() {
+        return {
+          "X-Algolia-Application-Id": this.appId,
+          "X-Algolia-API-Key": this.apiKey,
+          "content-type": "application/json",
+          accept: "application/json",
+          referer: "https://www.newbalance.com/",
+          origin: "https://www.newbalance.com",
+        };
+      },
+
+      // One Algolia hit is a STYLE carrying every colourway, so the hit is
+      // expanded into one candidate per colourway: that is the granularity the
+      // source rows have (one row per colour + size), and the composite cannot
+      // tell two colourways apart from the title alone.
+      extractHits: (response) => {
+        const results = response?.results;
+        const hits = Array.isArray(results) && results[0] ? results[0].hits : response?.hits;
+        if (!Array.isArray(hits)) return [];
+
+        const out = [];
+        for (const hit of hits) {
+          const styleData = hit?.styleData && typeof hit.styleData === "object" ? hit.styleData : {};
+          const codes = Object.keys(styleData);
+          if (codes.length === 0) {
+            out.push({ hit, colourCode: "", style: null });
+            continue;
+          }
+          for (const code of codes) out.push({ hit, colourCode: code, style: styleData[code] });
+        }
+        return out;
+      },
+
+      mapHit: (entry) => {
+        const hit = entry?.hit || {};
+        const style = entry?.style || {};
+        const colourCode = String(entry?.colourCode || "");
+
+        // Prices are per-colourway and keyed by currency. USD only on this
+        // index; `price.USD` is the shelf price, the retail pricebook is the
+        // list price it is struck through against.
+        const usd = style?.price?.USD;
+        const books = Array.isArray(style?.pricebooks?.USD) ? style.pricebooks.USD : [];
+        const retail = books.find((b) => /retail/i.test(String(b?.pricebookID || "")));
+        const price = round2(usd ?? retail?.price);
+        const mrp = round2(retail?.price ?? usd) || price;
+
+        const name = String(hit?.name || "").trim();
+
+        // Images live on colorVariations, matched to this colourway by its
+        // variationURL / image path containing the colour code.
+        const variations = Array.isArray(hit?.colorVariations) ? hit.colorVariations : [];
+        const mine = variations.find((v) =>
+          String(v?.variationURL || "").toUpperCase().includes(colourCode.toUpperCase())
+          || String(v?.color || "").toUpperCase() === colourCode.toUpperCase());
+        const groups = Array.isArray(mine?.image_groups) ? mine.image_groups : [];
+        const images = groups
+          .flatMap((g) => (Array.isArray(g?.images) ? g.images : []))
+          .map((i) => String(i?.dis_base_link || ""))
+          .filter(Boolean);
+
+        // The size and width lists are per STYLE, not per colourway, on this
+        // index — carried so index.js can check the source row's size is sold.
+        const vd = hit?.variantData && typeof hit.variantData === "object" ? hit.variantData : {};
+        const sizeKeys = Object.keys(vd).filter((k) => /size/i.test(k) && !/width/i.test(k));
+        const availableSizes = [...new Set(
+          sizeKeys.flatMap((k) => (Array.isArray(vd[k]) ? vd[k] : [])).map((s) => String(s).trim()),
+        )].filter(Boolean);
+        const widthKeys = Object.keys(vd).filter((k) => /width/i.test(k));
+        const availableWidths = [...new Set(
+          widthKeys.flatMap((k) => (Array.isArray(vd[k]) ? vd[k] : [])).map((s) => String(s).trim()),
+        )].filter(Boolean);
+
+        return {
+          url: String(style?.url || hit?.pdpLink || "").trim(),
+          category: String(hit?.searchCategoryName || hit?.__primary_category || "").trim(),
+          brand: "New Balance",
+          // The colour code is appended because `name` is identical across a
+          // style's colourways ("530 Bungee" x7), so without it every
+          // candidate is textually the same and colour carries no weight.
+          title: colourCode ? `${name} - ${colourCode}` : name,
+          // The VARIATION's own id ("PZ530SB1-M-01"), falling back to the
+          // colour code then the style.
+          sku: String(style?.variantID || colourCode || hit?.styleID || ""),
+          price,
+          mrp,
+          totalRating: "",
+          totalReview: "",
+          express: false,
+          description: htmlToText(hit?.short_description || ""),
+          images,
+
+          // Carried for the variation match in index.js.
+          styleCode: String(colourCode || hit?.styleID || ""),
+          parentStyleId: String(hit?.styleID || ""),
+          colourCode,
+          availableSizes,
+          availableWidths,
+          inStock: hit?.in_stock !== false,
+          specifications: {
+            styleID: String(hit?.styleID || ""),
+            colourCode,
+            variantID: String(style?.variantID || ""),
+            productType: String(hit?.custom?.productType || ""),
+            gender: String(hit?.custom?.genderDisplay || ""),
+            sizes: availableSizes.join(", "),
+            widths: availableWidths.join(", "),
           },
         };
       },
